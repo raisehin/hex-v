@@ -23,8 +23,12 @@ const window_height = 128
 const window_class_name = 'hexv_surface'
 const window_top_offset = 48
 
-// Paint target: 240 Hz, matching the simulation's 1/240 s substep.
-const paint_period = f64(1.0) / 240.0
+// Paint target: at most 60 Hz. The simulation keeps its own 1/240 s substep
+// (`scope.advance` drains `pending` until it is below `step_h`), so slowing the
+// paint does not slow the sim or change any frame; it only stops the HUD from
+// re-rendering faster than a display can show it. The raster costs ~9 ms per
+// paint, so 60 Hz also stops the paint loop from saturating a core.
+const paint_period = f64(1.0) / 60.0
 const paint_sleep_floor = 0.002
 const paint_probe_frames = 600
 
@@ -184,19 +188,23 @@ fn (clock &PaintClock) seconds() f64 {
 	return f64(clock.nanos() - clock.started) / 1_000_000_000.0
 }
 
-// pace waits until the paint deadline, one millisecond at a time once
-// timeBeginPeriod(1) is in effect.
+// pace waits until the paint deadline. A wait long enough to be a stall (dead
+// code path at 60 Hz) is slept off in one call; the last few milliseconds are
+// spun on the clock instead. `Sleep` is not usable for the short wait: on this
+// machine it is quantised to a full scheduler tick, which overshoots a 16.7 ms
+// period by up to 15 ms and lands the paint a whole period late.
 fn pace(deadline f64, clock &PaintClock) {
 	for {
 		remain := deadline - clock.seconds()
 		if remain <= 0.0 {
 			return
 		}
-		if remain > paint_sleep_floor {
-			C.Sleep(1)
-		} else {
-			C.Sleep(0)
+		if remain > paint_sleep_floor * 5.0 {
+			C.Sleep(u32(int(remain * 1000.0) - 1))
+			continue
 		}
+		for clock.seconds() < deadline {}
+		return
 	}
 }
 
@@ -609,7 +617,9 @@ pub fn run_paint_pacing() {
 		}
 		previous = stamp
 		paints++
-		next_paint = paint_deadline(next_paint, now)
+		// Re-read the clock: `now` predates the whole paint, so pacing against it
+		// would schedule the next deadline up to one paint in the past.
+		next_paint = paint_deadline(next_paint, clock.seconds())
 		pace(next_paint, &clock)
 	}
 	C.timeEndPeriod(1)
