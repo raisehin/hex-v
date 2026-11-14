@@ -8,6 +8,7 @@ import time
 const min_recording_samples = 3200 // 0.2 s at 16 kHz
 const seg_min_samples = 16000
 const seg_ctx_samples = 3200
+const vad_ctx_samples = 16384
 const seg_poll_ms = 500
 const seg_silence_ms = 500
 
@@ -18,10 +19,6 @@ enum HostState {
 	cancelling
 }
 
-struct SegmentJob {
-	samples    []f32
-	generation int
-}
 
 struct TranscribeResult {
 mut:
@@ -42,13 +39,12 @@ mut:
 	state        HostState
 	generation   int
 	ch           chan TranscribeResult
-	seg_jobs     chan SegmentJob
 	seg_threads  []thread
 	seg_mu       sync.Mutex
 	seg_texts    []string
 	seg_cursor   int
-	seg_last_poll f64
 	seg_active   bool
+	seg_fail     int
 	last_use     f64
 	last_wav     string
 	busy         bool
@@ -59,7 +55,6 @@ fn new_host(cfg HostConfig) &Host {
 		cfg:      cfg
 		asr:      &AsrShim{}
 		ch:       chan TranscribeResult{cap: 4}
-		seg_jobs: chan SegmentJob{cap: 1}
 		state:    .idle
 		last_wav: '${cfg.data_dir}\\hexv-last.wav'
 	}
@@ -121,26 +116,106 @@ fn preload_worker(asr &AsrShim, model_path string, threads int, vad_path string)
 	asr.ensure_model(model_path, threads) or { hexv_log('preload: ${err}') }
 }
 
-fn segment_worker(mut h Host, jobs chan SegmentJob) {
-	for {
-		job := <-jobs or { break }
-		if job.generation != h.generation {
-			continue
+fn segment_worker(mut h Host) {
+	for h.segmenter_running() {
+		time.sleep(seg_poll_ms * time.millisecond)
+		if !h.segmenter_running() {
+			break
 		}
-		trimmed, trim_ms := trim_trailing_silence(job.samples)
-		t0 := time.sys_mono_now()
-		text, _ := h.asr.transcribe(trimmed, h.cfg.language) or {
-			hexv_log('segment inference failed: ${err}')
-			continue
-		}
-		if text.len > 0 && job.generation == h.generation {
-			h.seg_mu.lock()
-			h.seg_texts << text
-			h.seg_mu.unlock()
-		}
-		elapsed := f64(time.sys_mono_now() - t0) / 1_000_000.0
-		hexv_log('segment: samples=${job.samples.len} trim=${trim_ms} ms inference=${elapsed:.0f} ms chars=${text.len}')
+		h.segment_poll()
 	}
+}
+
+fn (mut h Host) segmenter_running() bool {
+	h.seg_mu.lock()
+	defer {
+		h.seg_mu.unlock()
+	}
+	return h.seg_active
+}
+
+// segment_poll runs entirely on the segment worker: VAD, then inference. The
+// paint thread only pumps the mic and draws. Only the suffix is copied, and
+// the VAD gets 1.024 s of left context so its splice point stays close to the
+// old whole-buffer answer.
+fn (mut h Host) segment_poll() {
+	h.seg_mu.lock()
+	mut cursor := h.seg_cursor
+	h.seg_mu.unlock()
+
+	mut lo := cursor - vad_ctx_samples
+	if lo < 0 {
+		lo = 0
+	}
+	// The VAD consumes 512-sample frames; keeping its start on that grid makes
+	// a suffix call match the whole-buffer boundary instead of shifting it.
+	lo -= lo % 512
+	sfx := h.capture.snapshot_16k_from(lo)
+	if sfx.len == 0 {
+		return
+	}
+
+	t_vad := time.sys_mono_now()
+	rel_end := int(h.asr.vad_speech_end(sfx, seg_silence_ms))
+	vad_ms := f64(time.sys_mono_now() - t_vad) / 1_000_000.0
+	if rel_end < 0 {
+		// -1 means no segment is closed yet: defer, do not retry/advance.
+		return
+	}
+	abs_end := lo + rel_end
+
+	h.seg_mu.lock()
+	cursor = h.seg_cursor
+	h.seg_mu.unlock()
+	if abs_end <= cursor + seg_min_samples || abs_end <= cursor || rel_end > sfx.len {
+		return
+	}
+
+	mut slice_start := cursor - seg_ctx_samples
+	if slice_start < 0 {
+		slice_start = 0
+	}
+	slice_start -= lo
+	if slice_start < 0 {
+		slice_start = 0
+	}
+	if rel_end <= slice_start || rel_end > sfx.len {
+		return
+	}
+	// If the session is not open yet, leave this audio for the tail instead of
+	// spinning on the same span.
+	if !h.asr.is_loaded() {
+		return
+	}
+
+	slice := sfx[slice_start..rel_end]
+	trimmed, trim_ms := trim_trailing_silence(slice)
+	t_infer := time.sys_mono_now()
+	text, _ := h.asr.transcribe(trimmed, h.cfg.language) or {
+		h.seg_mu.lock()
+		h.seg_fail += 1
+		fails := h.seg_fail
+		if fails >= 3 {
+			h.seg_cursor = abs_end
+			h.seg_fail = 0
+		}
+		h.seg_mu.unlock()
+		hexv_log('segment inference failed: ${err} (fail=${fails})')
+		return
+	}
+	elapsed := f64(time.sys_mono_now() - t_infer) / 1_000_000.0
+
+	h.seg_mu.lock()
+	if h.seg_active {
+		if text.len > 0 {
+			h.seg_texts << text
+		}
+		h.seg_cursor = abs_end
+		h.seg_fail = 0
+	}
+	h.seg_mu.unlock()
+	hexv_log('segment boundary: ${cursor}..${abs_end} (${abs_end - cursor} new samples) vad=${vad_ms:.0f} ms')
+	hexv_log('segment: samples=${trimmed.len} trim=${trim_ms} ms inference=${elapsed:.0f} ms chars=${text.len}')
 }
 
 fn tail_worker(asr &AsrShim, model_path string, threads int, language string,
@@ -193,12 +268,10 @@ fn (mut h Host) start(now f64) ! {
 	h.seg_mu.lock()
 	h.seg_texts.clear()
 	h.seg_cursor = 0
-	h.seg_mu.unlock()
-	h.seg_jobs = chan SegmentJob{cap: 8}
-	jobs := h.seg_jobs
-	h.seg_threads << spawn segment_worker(mut h, jobs)
+	h.seg_fail = 0
 	h.seg_active = true
-	h.seg_last_poll = now
+	h.seg_mu.unlock()
+	h.seg_threads << spawn segment_worker(mut h)
 	h.state = .recording
 	power_eco(false)
 	spawn preload_worker(h.asr, h.cfg.model_path(), h.cfg.threads, h.cfg.vad_path())
@@ -213,39 +286,13 @@ fn (mut h Host) pump_level() f32 {
 	return h.capture.rms_db()
 }
 
-// segment_tick polls the VAD every SEG_POLL_MS and sends a closed segment to
-// the segment worker. The main loop stays free to paint the HUD.
-fn (mut h Host) segment_tick(now f64) {
-	if !h.seg_active || h.state != .recording {
-		return
-	}
-	if now - h.seg_last_poll < f64(seg_poll_ms) / 1000.0 {
-		return
-	}
-	h.seg_last_poll = now
-	samples := h.capture.snapshot_16k()
-	if samples.len <= seg_ctx_samples {
-		return
-	}
-	end := int(h.asr.vad_speech_end(samples, seg_silence_ms))
-	if end <= h.seg_cursor + seg_min_samples || end > samples.len {
-		return
-	}
-	lo := if h.seg_cursor > seg_ctx_samples { h.seg_cursor - seg_ctx_samples } else { 0 }
-	slice := samples[lo..end].clone()
-	old_cursor := h.seg_cursor
-	h.seg_cursor = end
-	h.seg_jobs <- SegmentJob{
-		samples:    slice
-		generation: h.generation
-	}
-	hexv_log('segment boundary: ${old_cursor}..${end} (${end - old_cursor} new samples)')
-}
-
+// segment_tick is gone: the segment worker owns the 500 ms cadence, so the
+// paint thread never calls the VAD or waits on the shim lock.
 fn (mut h Host) stop_segmenter() {
+	h.seg_mu.lock()
 	h.seg_active = false
+	h.seg_mu.unlock()
 	if h.seg_threads.len > 0 {
-		h.seg_jobs.close()
 		h.seg_threads.wait()
 		h.seg_threads.clear()
 	}
@@ -255,13 +302,15 @@ fn (mut h Host) stop(now f64) ! {
 	if h.state != .recording {
 		return error('not recording')
 	}
+	// Join the segmenter before tearing down capture: the worker reads the
+	// capture buffer, so stopping first could let it snapshot a cleared take.
+	h.stop_segmenter()
 	samples := h.capture.stop()!
 	h.last_use = now
 	wav_write_f32(h.last_wav, samples, 16000) or {
 		hexv_log('could not save last recording: ${err}')
 	}
 	hexv_log('recording stopped: ${samples.len} samples (${f64(samples.len) / 16000.0:.2f} s) -> ${h.last_wav}')
-	h.stop_segmenter()
 	h.seg_mu.lock()
 	prefix := h.seg_texts.clone()
 	cursor := h.seg_cursor
