@@ -9,6 +9,7 @@
 module main
 
 import math
+import sync
 
 #flag -lwinmm
 #include <windows.h>
@@ -142,6 +143,7 @@ fn capture_available() int {
 // device holds the buffer.
 struct Capture {
 mut:
+	mu                sync.Mutex
 	active            bool
 	device            voidptr // HWAVEIN
 	rate              u32 // device sample rate of the open stream
@@ -239,10 +241,14 @@ fn (mut c Capture) start() ! {
 // recording and re-queues it. Call it at HUD cadence; it never allocates the
 // ring, only grows the downmixed sample tail.
 fn (mut c Capture) pump() {
+	c.mu.lock()
+	defer {
+		c.mu.unlock()
+	}
 	if !c.active {
 		return
 	}
-	c.drain(true)
+	c.drain_locked(true)
 }
 
 // rms_db is the level of the last ~50 ms of the recording, clamped to
@@ -269,11 +275,58 @@ fn (c &Capture) rms_db() f32 {
 }
 
 
-// snapshot_16k returns the recording so far as mono 16 kHz f32. The segmenter
-// polls this every 500 ms; it never consumes the recording, so stop() still
-// returns the complete take.
-fn (c &Capture) snapshot_16k() []f32 {
-	return capture_resample_16k(c.samples, int(c.rate))
+// snapshot_16k returns the whole recording as mono 16 kHz f32. The segmenter
+// uses snapshot_16k_from; this remains for callers that need the complete take.
+fn (mut c Capture) snapshot_16k() []f32 {
+	c.mu.lock()
+	defer {
+		c.mu.unlock()
+	}
+	return c.snapshot_16k_from_locked(0)
+}
+
+// snapshot_16k_from returns only the 16 kHz suffix starting at start_16k. At
+// 16 kHz this is a direct slice clone; otherwise the resample starts at the
+// absolute device index so the suffix grid matches stop()'s whole-take grid.
+fn (mut c Capture) snapshot_16k_from(start_16k int) []f32 {
+	c.mu.lock()
+	defer {
+		c.mu.unlock()
+	}
+	return c.snapshot_16k_from_locked(start_16k)
+}
+
+fn (mut c Capture) snapshot_16k_from_locked(start_16k int) []f32 {
+	mut s16 := start_16k
+	if s16 < 0 {
+		s16 = 0
+	}
+	rate := int(c.rate)
+	if rate <= 0 || c.samples.len == 0 {
+		return []f32{}
+	}
+	if rate == capture_out_rate {
+		if s16 >= c.samples.len {
+			return []f32{}
+		}
+		return c.samples[s16..].clone()
+	}
+	n_out_abs := int(f64(c.samples.len) * f64(capture_out_rate) / f64(rate))
+	if s16 >= n_out_abs {
+		return []f32{}
+	}
+	n_out := n_out_abs - s16
+	mut out := []f32{len: n_out}
+	last := c.samples.len - 1
+	for i in 0 .. n_out {
+		src := f64(s16 + i) * f64(rate) / f64(capture_out_rate)
+		i0 := int(src)
+		t := f32(src - f64(i0))
+		a := c.samples[if i0 < last { i0 } else { last }]
+		b := c.samples[if i0 + 1 < last { i0 + 1 } else { last }]
+		out[i] = a + (b - a) * t
+	}
+	return out
 }
 
 // native_len is the number of mono samples recorded at the device rate so far.
@@ -285,11 +338,15 @@ fn (c &Capture) native_len() int {
 // recording as mono f32 linearly resampled to 16 kHz. Calling it when nothing
 // is recording returns an empty slice.
 fn (mut c Capture) stop() ![]f32 {
+	c.mu.lock()
+	defer {
+		c.mu.unlock()
+	}
 	if !c.active {
 		return []f32{}
 	}
 	rate := int(c.rate)
-	c.teardown(true)
+	c.teardown_locked(true)
 	out := capture_resample_16k(c.samples, rate)
 	c.samples.clear()
 	return out
@@ -298,19 +355,32 @@ fn (mut c Capture) stop() ![]f32 {
 // cancel ends the stream and throws the recording away. Safe to call when
 // nothing is recording.
 fn (mut c Capture) cancel() {
+	c.mu.lock()
+	defer {
+		c.mu.unlock()
+	}
 	if !c.active {
 		// A start() that failed mid-way already tore itself down; make sure no
 		// stale tail survives either way.
 		c.samples.clear()
 		return
 	}
-	c.teardown(false)
+	c.teardown_locked(false)
 	c.samples.clear()
 }
 
 // drain collects the done buffers. When requeue is set they go back to the
-// driver, otherwise (during shutdown) they are only harvested.
+// driver, otherwise (during shutdown) they are only harvested. Callers hold
+// c.mu; drain_locked is the shared body.
 fn (mut c Capture) drain(requeue bool) {
+	c.mu.lock()
+	defer {
+		c.mu.unlock()
+	}
+	c.drain_locked(requeue)
+}
+
+fn (mut c Capture) drain_locked(requeue bool) {
 	for i in 0 .. c.buffers.len {
 		if c.buffers[i].flags & whdr_done == 0 {
 			continue
@@ -331,6 +401,7 @@ fn (mut c Capture) drain(requeue bool) {
 
 // append_block downmixes the interleaved i16 of buffer `index` into mono f32 in
 // [-1, 1]: each channel sample is divided by 32768 and averaged across channels.
+// The caller holds c.mu.
 fn (mut c Capture) append_block(index int, bytes int) {
 	frames := bytes / c.block_align
 	if frames <= 0 {
@@ -354,12 +425,20 @@ fn (mut c Capture) append_block(index int, bytes int) {
 // teardown stops and closes the stream. waveInReset marks every queued buffer
 // WHDR_DONE, so the harvest after it sees the driver's final data.
 fn (mut c Capture) teardown(harvest bool) {
+	c.mu.lock()
+	defer {
+		c.mu.unlock()
+	}
+	c.teardown_locked(harvest)
+}
+
+fn (mut c Capture) teardown_locked(harvest bool) {
 	handle := c.device
 	if handle != voidptr(0) {
 		C.waveInStop(handle)
 		C.waveInReset(handle)
 		if harvest {
-			c.drain(false)
+			c.drain_locked(false)
 		}
 		for i in 0 .. c.buffers.len {
 			C.waveInUnprepareHeader(handle, unsafe { &c.buffers[i] }, u32(sizeof(HexWaveHdr)))
@@ -386,9 +465,9 @@ fn capture_resample_16k(mono []f32, rate int) []f32 {
 	mut out := []f32{len: n_out}
 	last := mono.len - 1
 	for i in 0 .. n_out {
-		src := f32(i) * f32(rate) / f32(capture_out_rate)
+		src := f64(i) * f64(rate) / f64(capture_out_rate)
 		i0 := int(src)
-		t := src - f32(i0)
+		t := f32(src - f64(i0))
 		a := mono[if i0 < last { i0 } else { last }]
 		b := mono[if i0 + 1 < last { i0 + 1 } else { last }]
 		out[i] = a + (b - a) * t

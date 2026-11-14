@@ -541,7 +541,6 @@ pub fn run_window() {
 		}
 		if host.state == .recording {
 			indicator.loudness = host.pump_level()
-			host.segment_tick(now)
 		}
 		result, accepted := host.poll(now)
 		if accepted {
