@@ -1,15 +1,21 @@
-# Local-only build entry point. CI uses build-github.ps1.
+# Local-only build entry point. Use build-github.ps1 for clean builds.
 /build.ps1
+
+# Local-only benchmark policy/notes. Never commit benchmark output.
+/benchmarks.md
 
 # Build output
 /v/bin/
 
 # Generated reference frames and dumps
 /v/out/
-
-# Oracle build products
-/oracle/target/
+/v/out/frames/
+/v/out/*.bin
 /oracle/out/
+/oracle/target/
+*.uniform.bin
+frames.bin
+dots.bin
 
 # The oracle is reference material, not a compile input.
 /oracle/
@@ -17,6 +23,7 @@
 # Runtime state and dependencies
 *.log
 /models/
+models/
 *.gguf
 *.dll
 
