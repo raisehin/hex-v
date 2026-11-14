@@ -19,6 +19,7 @@ import os
 fn C.powf(x f32, y f32) f32
 fn C.tanhf(x f32) f32
 fn C.floorf(x f32) f32
+fn C.ceilf(x f32) f32
 fn C.roundf(x f32) f32
 fn C.sqrtf(x f32) f32
 
@@ -395,6 +396,67 @@ fn fragment(scene &Scene, pal Palette, table []Dot, uv Vec2) Rgba {
 	return for_target(dithered(result, position))
 }
 
+// The pixel rectangle that can produce a non-zero byte. Pixels outside it are
+// left as the zero the buffer starts with.
+struct Bounds {
+	x0 int
+	x1 int
+	y0 int
+	y1 int
+}
+
+fn clamp_i(x int, lo int, hi int) int {
+	if x < lo {
+		return lo
+	}
+	if x > hi {
+		return hi
+	}
+	return x
+}
+
+// `lit_bounds` is the conservative early-out: it sizes a rectangle around the
+// plate and its drop shadow and `render_rgba` only shades inside it.
+//
+// The plate's zero set reaches `half_size`, and the shadow is the same box 3 pt
+// lower. Outside both, every remaining term is either exactly zero or is the
+// shadow:
+//
+//   - plate coverage is `sstep(aa, -aa, distance)`, which is exactly 0 for
+//     `distance >= aa`; the rim is the same test on `|distance| - 0.3`;
+//   - the glow and every dot are multiplied by `shape`, so they vanish with it;
+//   - what is left is the shadow, alpha = `shadow.a * 0.5 * (1 - tanh(d/6.5))`.
+//     With `shadow.a <= 0.5` and `pose_opacity <= 1`, a byte is zero once
+//     `alpha * 256 < 0.5` - 256 rather than 255 so the dither, which is bounded
+//     by `alpha`, also rounds to zero. That needs `1 - tanh < 1/256`, i.e.
+//     `d > artanh(255/256) * 6.5 = 20.3` pt.
+//
+// So a 24 pt margin is enough with headroom, and `aa` is folded in so a large
+// `pose_softness` widens the box rather than breaking the argument.
+fn lit_bounds(scene &Scene, half_size Vec2) Bounds {
+	width := scene.width
+	height := scene.height
+	// `fragment` maps a pixel to point space as (position - resolution/2) /
+	// (backing_scale * scale), with the plate's layout offset at zero.
+	scale := maxf(scene.pose_scale, 0.001)
+	inv := scene.backing_scale * scale
+	if inv <= 0.0 {
+		return Bounds{0, width - 1, 0, height - 1}
+	}
+	aa := (1.0 / inv) * 0.75 + maxf(scene.pose_softness, 0.0) * 0.72
+	margin := maxf(24.0, aa + 1.0)
+	reach_x := half_size.x + margin
+	reach_y := half_size.y + margin + 3.0
+	half_w := f32(width) * 0.5
+	half_h := f32(height) * 0.5
+	return Bounds{
+		x0: clamp_i(int(C.floorf(half_w - 0.5 - reach_x * inv)), 0, width - 1)
+		x1: clamp_i(int(C.ceilf(half_w - 0.5 + reach_x * inv)), 0, width - 1)
+		y0: clamp_i(int(C.floorf(half_h - 0.5 - reach_y * inv)), 0, height - 1)
+		y1: clamp_i(int(C.ceilf(half_h - 0.5 + reach_y * inv)), 0, height - 1)
+	}
+}
+
 // A frame as premultiplied RGBA bytes, sRGB, `width * height * 4` of them.
 pub fn render_rgba(scene &Scene) []u8 {
 	needed := scene.columns * scene.rows * 2
@@ -408,8 +470,9 @@ pub fn render_rgba(scene &Scene) []u8 {
 	width := f32(scene.width)
 	height := f32(scene.height)
 	mut out := []u8{len: scene.width * scene.height * 4}
-	for y in 0 .. scene.height {
-		for x in 0 .. scene.width {
+	bounds := lit_bounds(scene, half_size)
+	for y in bounds.y0 .. bounds.y1 + 1 {
+		for x in bounds.x0 .. bounds.x1 + 1 {
 			uv := v2((f32(x) + 0.5) / width, (f32(y) + 0.5) / height)
 			c := fragment(scene, pal, table, uv)
 			i := (y * scene.width + x) * 4
