@@ -12,6 +12,15 @@ const vad_ctx_samples = 16384
 const seg_poll_ms = 500
 const seg_silence_ms = 500
 
+// A segment used to close only on `seg_silence_ms` of silence, so continuous
+// speech never checkpointed at all: in the log a 120 s take closed its last
+// segment at 88.5 s and the whole 31.6 s remainder was transcribed in one tail
+// call after the key came up (7,679 ms). Past this many unsegmented samples the
+// worker cuts anyway, which bounds release-to-text latency at one segment.
+const seg_force_cut_samples = 96000 // 6 s at 16 kHz
+const seg_force_search_samples = 19200 // 1.2 s window to look for the quietest cut
+const seg_frame_samples = 320 // 20 ms at 16 kHz
+
 enum HostState {
 	idle
 	recording
@@ -116,13 +125,32 @@ fn preload_worker(asr &AsrShim, model_path string, threads int, vad_path string)
 	asr.ensure_model(model_path, threads) or { hexv_log('preload: ${err}') }
 }
 
+// segment_worker polls on a deadline rather than sleeping a fixed 500 ms after
+// each poll. The old loop slept *after* the poll finished, so with 0.34-0.55 s
+// of inference the real cadence was 0.9-1.05 s and a forced cut at 6 s landed at
+// 6-7 s. It also slept before the first poll, which delayed the first checkpoint
+// of every take by a full interval.
+//
+// The wait is sliced so stop_segmenter() is not held hostage by it: a release
+// used to wait out whatever was left of the sleep, up to 500 ms, with nothing in
+// flight.
 fn segment_worker(mut h Host) {
+	mut next_poll := time.sys_mono_now()
 	for h.segmenter_running() {
-		time.sleep(seg_poll_ms * time.millisecond)
-		if !h.segmenter_running() {
-			break
-		}
 		h.segment_poll()
+		next_poll += time.Duration(seg_poll_ms) * time.millisecond
+		for h.segmenter_running() {
+			now := time.sys_mono_now()
+			if now >= next_poll {
+				break
+			}
+			remain := next_poll - now
+			if remain > 2 * time.millisecond {
+				time.sleep(2 * time.millisecond)
+			} else {
+				time.sleep(remain)
+			}
+		}
 	}
 }
 
@@ -132,6 +160,31 @@ fn (mut h Host) segmenter_running() bool {
 		h.seg_mu.unlock()
 	}
 	return h.seg_active
+}
+
+// quietest_frame_end returns the sample just past the lowest-energy 20 ms frame
+// in [from, to), so a forced cut lands in the quietest part of the window rather
+// than in the middle of a word. Returns `to` when the window holds no whole
+// frame.
+fn quietest_frame_end(samples []f32, from int, to int) int {
+	if to - from < seg_frame_samples {
+		return to
+	}
+	mut best := from
+	mut best_energy := f32(-1.0)
+	mut i := from
+	for i + seg_frame_samples <= to {
+		mut acc := f32(0.0)
+		for s in samples[i..i + seg_frame_samples] {
+			acc += s * s
+		}
+		if best_energy < 0.0 || acc < best_energy {
+			best_energy = acc
+			best = i
+		}
+		i += seg_frame_samples
+	}
+	return best + seg_frame_samples
 }
 
 // segment_poll runs entirely on the segment worker: VAD, then inference. The
@@ -156,11 +209,32 @@ fn (mut h Host) segment_poll() {
 	}
 
 	t_vad := time.sys_mono_now()
-	rel_end := int(h.asr.vad_speech_end(sfx, seg_silence_ms))
+	mut rel_end := int(h.asr.vad_speech_end(sfx, seg_silence_ms))
 	vad_ms := f64(time.sys_mono_now() - t_vad) / 1_000_000.0
+	mut forced := false
 	if rel_end < 0 {
-		// -1 means no segment is closed yet: defer, do not retry/advance.
-		return
+		// No silence has closed a segment. Without this a monologue never
+		// checkpoints, because the cursor only moves on a closed segment and
+		// stop() then hands the whole remainder to one tail inference.
+		need := cursor + seg_force_cut_samples - lo
+		if need > 0 && sfx.len >= need {
+			mut from := need - seg_force_search_samples
+			floor := (cursor - lo) + seg_min_samples
+			if from < floor {
+				from = floor
+			}
+			if from < 0 {
+				from = 0
+			}
+			if from < need {
+				rel_end = quietest_frame_end(sfx, from, need)
+				forced = true
+			}
+		}
+		if !forced {
+			// No segment is closed yet: defer, do not retry/advance.
+			return
+		}
 	}
 	abs_end := lo + rel_end
 
@@ -214,7 +288,7 @@ fn (mut h Host) segment_poll() {
 		h.seg_fail = 0
 	}
 	h.seg_mu.unlock()
-	hexv_log('segment boundary: ${cursor}..${abs_end} (${abs_end - cursor} new samples) vad=${vad_ms:.0f} ms')
+	hexv_log('segment boundary: ${cursor}..${abs_end} (${abs_end - cursor} new samples) forced=${forced} vad=${vad_ms:.0f} ms')
 	hexv_log('segment: samples=${trimmed.len} trim=${trim_ms} ms inference=${elapsed:.0f} ms chars=${text.len}')
 }
 
