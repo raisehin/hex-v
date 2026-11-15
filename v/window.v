@@ -548,17 +548,25 @@ pub fn run_window() {
 				hexv_log('transcription failed: ${result.err}')
 				indicator.on_failed(now)
 			} else {
-				paste_text(result.text) or {
-					hexv_log('paste failed: ${err}')
-					indicator.on_failed(now)
-				}
-				if indicator.phase != .failed {
-					hexv_log('pasted: ${result.text}')
-					indicator.on_completed(now)
-				}
+				// Off the paint thread: the paste leg can block for ~1 s, and
+				// blocking here froze the HUD and made keys.poll miss a quick
+				// Ctrl+Space tap entirely.
+				host.start_paste(result.text)
 			}
 		} else if result.generation != 0 {
 			hexv_log('transcription discarded')
+		}
+		mut pasted := PasteResult{}
+		if host.paste_ch.try_pop(mut pasted) == .success {
+			if pasted.generation != host.generation {
+				hexv_log('paste result dropped: dictation superseded')
+			} else if pasted.err.len > 0 {
+				hexv_log('paste failed: ${pasted.err}')
+				indicator.on_failed(now)
+			} else {
+				hexv_log('pasted: ${pasted.text}')
+				indicator.on_completed(now)
+			}
 		}
 		host.idle_check(now)
 		dt := now - last_step
