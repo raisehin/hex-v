@@ -375,8 +375,15 @@ fn (mut h Host) cancel() {
 	}
 }
 
+// idle_check releases the model after a quiet spell. It must only fire when the
+// host is genuinely idle: `busy` is false for the whole of `.recording` (it is
+// set in stop() and cleared in poll()), so gating on `busy` alone released the
+// model - and re-enabled EcoQoS throttling - in the middle of any take longer
+// than idle_model_seconds(). Every later poll then deferred on the
+// `!is_loaded()` guard without advancing the cursor, so the rest of the take was
+// uncheckpointed and the tail paid for a fresh model load on the release path.
 fn (mut h Host) idle_check(now f64) {
-	if h.busy {
+	if h.state != .idle {
 		return
 	}
 	if h.asr.is_loaded() && now - h.last_use >= idle_model_seconds() {
