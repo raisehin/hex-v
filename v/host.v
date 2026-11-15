@@ -85,9 +85,9 @@ fn new_host(cfg HostConfig) &Host {
 	}
 }
 
-// trim_trailing_silence is the same algorithm and constants as
-// odin-hex/src/transcribe.odin: 20 ms frames, -30 dB relative floor, five-frame
-// speech runs, 250 ms tail pad, and no cut shorter than 100 ms.
+// trim_trailing_silence is the same algorithm and constants as the reference
+// transcriber: 20 ms frames, -30 dB relative floor, five-frame speech runs,
+// 250 ms tail pad, and no cut shorter than 100 ms.
 fn trim_trailing_silence(samples []f32) ([]f32, int) {
 	rate := 16000
 	frame := rate * 20 / 1000

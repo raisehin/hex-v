@@ -1,6 +1,6 @@
 // Minimal 16-bit PCM RIFF/WAVE reader and writer. The reader downmixes to mono
-// and linearly resamples to 16 kHz, matching odin-hex/src/wav.odin so hex.exe
-// and hexv hear the same samples.
+// and linearly resamples to 16 kHz, matching the reference reader so both hosts
+// hear the same samples.
 module main
 
 import os
