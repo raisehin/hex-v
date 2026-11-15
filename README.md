@@ -29,13 +29,19 @@ uses that to compile the pinned compiler before building the app. It runs:
 v -prod -cc gcc -cflags "-ffp-contract=off" -o v/bin/hexv.exe v
 ```
 
-`SOURCE_DATE_EPOCH=0` is set for the linker so two clean builds produce the same
-`hexv.exe` SHA-256. The optional `build.ps1` is the maintainer's local-only
-script and is ignored by git.
+`SOURCE_DATE_EPOCH=0` is set for the linker so two clean builds of the same
+source produce the same `hexv.exe` SHA-256. Checked on 2026-11-15 by building
+two separate `git worktree add --detach` checkouts with `build-github.ps1`
+(V 0.5.2 `f9ebca4`, gcc 15.2.0): both were byte-identical. It is a
+same-source, same-toolchain claim, not a promise about every compiler. The
+optional `build.ps1` is the maintainer's local-only script and is ignored by
+git.
 
 The ASR shim is **runtime-only**. Compiling `hexv.exe` never needs
-`transcribe_shim.dll`; at run time it is resolved from `HEX_SHIM`, the
-executable directory, a `bin\` below it, or the DLL search path.
+`transcribe_shim.dll`, and `v/bin/` is git-ignored, so a clean checkout has to
+supply it: put it beside the exe (`v/bin/transcribe_shim.dll`) or point
+`HEX_SHIM` at it. Those are the two layouts that work; the resolution order in
+[Real dictation host](#real-dictation-host) has no search path.
 
 ## Reference app provenance
 
@@ -136,15 +142,75 @@ sits next to the exe. It does not copy the model or reimplement ASR.
 
 - default mic via Win32 `waveIn`, downmixed/resampled to mono 16 kHz f32;
 - Dot scope loudness comes from the real RMS;
-- **Ctrl+Space** starts/stops a dictation, **Esc** cancels (or quits when idle);
-- on stop the shim runs off-thread, the existing processing/done stages paint,
-  then the transcript is pasted with clipboard save/restore;
+- **Ctrl+Space** starts/stops a dictation; **Esc** cancels while recording or
+  transcribing and does nothing when idle; **Ctrl+Alt+Q** quits;
+- the shim runs *during* the take: a segment worker polls every 250 ms
+  (`host.v:14`) and closes a segment on 500 ms of silence or a forced cut at
+  6 s of unsegmented audio (`host.v:15`, `:22`), keeping each segment's text;
+- on stop only the remainder is transcribed off-thread, then the joined
+  transcript is pasted with clipboard save/restore;
 - the last recording is saved to `%APPDATA%\hex\hexv-last.wav`;
 - model load and inference timings are in `%APPDATA%\hex\logs\hexv.log`;
 - the model is released after 180 s idle (`HEX_MODEL_IDLE_SECS` overrides).
 
-Uses `%APPDATA%\hex\odin-config` (`model`, `language`, `threads`) and
-`%APPDATA%\hex\models\phonon-2.5-en-Q8_0.gguf` plus the Silero VAD model.
+`%APPDATA%\hex\odin-config`, read at startup:
+
+| key | effect |
+|---|---|
+| `model` | `phonon25_en` or omitted. Anything else is a **config error**: the id, the supported id and the fact are printed and logged, and the process exits 1 without opening a HUD. |
+| `language` | passed to the shim; `en` if empty. |
+| `threads` | `0` means `n - n/4` — 6 on this 8-thread CPU; a positive value is used as given. |
+| `paste_keys` | `ctrl_v` (default), `ctrl_shift_v`, `shift_insert` or `type`. |
+| `engine` | ignored. hex-v has one engine, the shim, so `engine=auto` selects nothing. |
+
+Models are read from `%APPDATA%\hex\models`: `phonon-2.5-en-Q8_0.gguf` — the
+only one hex-v will load — plus `silero-vad-v6.2-F32.gguf`.
+
+## Latency
+
+One measured take: `%APPDATA%\hex\logs\hexv.log`, 2026-11-15 14:09, 9.66 s of
+audio (154,529 samples, 16 kHz mono, 309,102 B). Every number is a log line
+from that take; its timestamps are only 1 s apart, so nothing here is derived
+by differencing them.
+
+| stage | measured | log line |
+|---|---|---|
+| model load, overlaps the take | 1118 ms | `model load 1118 ms threads=6 path=…phonon-2.5-en-Q8_0.gguf` |
+| segments 1-3, during recording | 1312 / 629 / 589 ms for 70,624 / 36,992 / 29,824 samples | `inference 1312 ms threads=6 samples=70624 chars=75`, then `inference 629 ms … samples=36992 chars=4` and `inference 589 ms … samples=29824 chars=26` |
+| tail after release | **535 ms** for 23,489 samples (1.47 s) | `tail: model-wait=0 ms inference=535 ms samples=23489 trim=0 ms prefix=3` |
+| paste | 139 chars | `pasted 139 chars via ctrl_v` |
+
+Release to text is therefore **about 0.55-0.60 s**: 535 ms of tail inference,
+then the clipboard write and `SendInput` chord (tens of ms, not logged). Two
+things that are easy to get wrong:
+
+- the `pasted` line is written *after* `paste_restore_delay_ms` (`paste.v:27`)
+  has slept 500 ms following the chord, so it is not the text-arrival time;
+  differencing it against `recording stopped` invents a delay nobody waits for;
+- `paste_wait_for_modifiers` (`paste.v:28`) can add up to 500 ms *before* the
+  chord, but only when Ctrl is still held once the tail finishes.
+
+Same build and WAV through the CLI: `inference 2085-2476 ms` for
+`samples=154529`, i.e. 216-256 ms per second of audio (per-second figures here
+use the samples actually inferred, so a row's `trim` is subtracted). That
+coefficient is not a constant: this take's 1.47 s tail runs at 364 ms/s, and a
+30 s take at 220 ms/s (`inference 6603 ms … samples=480000`), because fixed
+encoder cost dominates a short slice.
+
+Shipped from the speed-up work, all in `v/host.v`: a segment already in flight
+at release commits instead of being dropped and re-transcribed by the tail; the
+clipboard/paste leg runs on a worker, so the paint loop keeps polling keys;
+`seg_poll_ms` 250; exact leading zeros are skipped before inference; and an
+empty transcript over real audio is logged and surfaced as a failure rather
+than a silent success.
+
+Blocked, with the measurement that blocks it: **canary-180m-flash** loads in
+197 ms and runs at 70-111 ms per second of audio (`inference 679 ms …
+samples=154529 chars=0`, `inference 811 ms … samples=142880 chars=116`) against
+phonon's 216-256, but on this take it returns a valid *empty* transcript
+(`chars=0`, exit 0). Making it usable needs prompt and special-token
+conditioning in the shim, which is not in this repository. **Thread count** 6
+versus 8 has never been measured for hex-v, so no figure is claimed for it.
 
 ## Commands
 
