@@ -1,6 +1,5 @@
-// Runtime shim loader for odin-hex's transcribe.cpp DLL. The DLL is used in
-// place: no model copy, no second ASR implementation. ABI from
-// odin-hex/native/transcribe_shim.h.
+// Runtime shim loader for the transcribe.cpp DLL. The DLL is used in place: no
+// model copy, no second ASR implementation. ABI from native/transcribe_shim.h.
 module main
 
 import dl
@@ -129,7 +128,7 @@ fn host_config() HostConfig {
 			'language' { c.language = val }
 			'paste_keys' { c.paste_keys = val }
 			'threads' { c.threads = val.int() }
-			// 'engine' is an odin-hex knob. hex-v has exactly one engine (the
+			// 'engine' is not a hex-v setting: hex-v has exactly one engine (the
 			// transcribe shim), so the value was parsed and never read; it is
 			// ignored rather than pretended to do something.
 			else {}
@@ -181,8 +180,8 @@ fn hexv_log(msg string) {
 	os.write_file(path, '${old}[${stamp}] ${msg}\n') or {}
 }
 
-// worker_threads matches odin-hex: 0 means three quarters of the logical CPUs,
-// leaving one SMT sibling per physical core free for ggml's spinning pool.
+// asr_worker_threads: 0 means three quarters of the logical CPUs, leaving one
+// SMT sibling per physical core free for ggml's spinning pool.
 fn asr_worker_threads(want int) int {
 	if want > 0 {
 		return want

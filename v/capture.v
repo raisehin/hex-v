@@ -451,9 +451,9 @@ fn (mut c Capture) teardown_locked(harvest bool) {
 	c.pcm.clear()
 }
 
-// capture_resample_16k is the same linear interpolation as
-// odin-hex/src/wav.odin wav_read_mono16k: output sample i reads the source at
-// i * rate / 16000 and blends the two neighbouring samples.
+// capture_resample_16k is the same linear interpolation as the reference
+// wav_read_mono16k: output sample i reads the source at i * rate / 16000 and
+// blends the two neighbouring samples.
 fn capture_resample_16k(mono []f32, rate int) []f32 {
 	if mono.len == 0 || rate <= 0 {
 		return []f32{}
