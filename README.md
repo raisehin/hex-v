@@ -128,8 +128,11 @@ reveal, fail`). These are the plate terms the rasteriser needs.
 
 `hexv` uses an existing `transcribe_shim.dll` at runtime through V's `dl`
 module. The DLL is not part of the compile and is not tracked here. It is
-resolved from `HEX_SHIM`, the executable directory, a `bin\` below it, or the
-DLL search path. It does not copy the model or reimplement ASR.
+resolved from `HEX_SHIM` if set, otherwise from beside the executable,
+otherwise from a `bin\` below it; failing all of those it uses the bare name
+`transcribe_shim.dll`, which the OS resolves against the working directory.
+There is no PATH-style search, so a build is only self-contained if the DLL
+sits next to the exe. It does not copy the model or reimplement ASR.
 
 - default mic via Win32 `waveIn`, downmixed/resampled to mono 16 kHz f32;
 - Dot scope loudness comes from the real RMS;
