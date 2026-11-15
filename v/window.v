@@ -482,6 +482,14 @@ fn build_scene(f DotFrame) render.Scene {
 // run_window shows the real dictation host: Ctrl+Space starts/stops,
 // Ctrl+Alt+Q quits, Esc cancels only while dictating/transcribing.
 pub fn run_window() {
+	// Validate before hiding the console: otherwise a config error would be
+	// printed to a window nobody can see and the HUD simply would not appear.
+	cfg := host_config()
+	if cfg.config_error.len > 0 {
+		hexv_log('config error: ${cfg.config_error}')
+		eprintln('hexv: ${cfg.config_error}')
+		return
+	}
 	C.ShowWindow(C.GetConsoleWindow(), sw_hide)
 	mut surface := layered_surface_open(true) or {
 		eprintln('hexv: ${err}')
@@ -490,7 +498,7 @@ pub fn run_window() {
 	C.timeBeginPeriod(1)
 	mut clock := paint_clock_new()
 	mut indicator := indicator_new(tuning_default())
-	mut host := new_host(host_config())
+	mut host := new_host(cfg)
 	mut keys := KeyPoll{}
 	mut msg := W32Msg{}
 	mut last_step := clock.seconds()
@@ -548,17 +556,25 @@ pub fn run_window() {
 				hexv_log('transcription failed: ${result.err}')
 				indicator.on_failed(now)
 			} else {
-				paste_text(result.text) or {
-					hexv_log('paste failed: ${err}')
-					indicator.on_failed(now)
-				}
-				if indicator.phase != .failed {
-					hexv_log('pasted: ${result.text}')
-					indicator.on_completed(now)
-				}
+				// Off the paint thread: the paste leg can block for ~1 s, and
+				// blocking here froze the HUD and made keys.poll miss a quick
+				// Ctrl+Space tap entirely.
+				host.start_paste(result.text)
 			}
 		} else if result.generation != 0 {
 			hexv_log('transcription discarded')
+		}
+		mut pasted := PasteResult{}
+		if host.paste_ch.try_pop(mut pasted) == .success {
+			if pasted.generation != host.generation {
+				hexv_log('paste result dropped: dictation superseded')
+			} else if pasted.err.len > 0 {
+				hexv_log('paste failed: ${pasted.err}')
+				indicator.on_failed(now)
+			} else {
+				hexv_log('pasted: ${pasted.text}')
+				indicator.on_completed(now)
+			}
 		}
 		host.idle_check(now)
 		dt := now - last_step

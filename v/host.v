@@ -9,8 +9,19 @@ const min_recording_samples = 3200 // 0.2 s at 16 kHz
 const seg_min_samples = 16000
 const seg_ctx_samples = 3200
 const vad_ctx_samples = 16384
-const seg_poll_ms = 500
+// 500 ms left up to a full interval of uncheckpointed audio behind every
+// release; the VAD call itself costs 30-50 ms, so the poll can run faster.
+const seg_poll_ms = 250
 const seg_silence_ms = 500
+
+// A segment used to close only on `seg_silence_ms` of silence, so continuous
+// speech never checkpointed at all: in the log a 120 s take closed its last
+// segment at 88.5 s and the whole 31.6 s remainder was transcribed in one tail
+// call after the key came up (7,679 ms). Past this many unsegmented samples the
+// worker cuts anyway, which bounds release-to-text latency at one segment.
+const seg_force_cut_samples = 96000 // 6 s at 16 kHz
+const seg_force_search_samples = 19200 // 1.2 s window to look for the quietest cut
+const seg_frame_samples = 320 // 20 ms at 16 kHz
 
 enum HostState {
 	idle
@@ -31,6 +42,17 @@ mut:
 	generation int
 }
 
+// PasteResult carries the outcome of the clipboard/paste leg back to the paint
+// thread, which polls for it instead of blocking on it. generation lets the
+// paint thread and the worker itself drop a paste that belongs to a take the
+// user has already superseded.
+struct PasteResult {
+mut:
+	text       string
+	err        string
+	generation int
+}
+
 struct Host {
 mut:
 	cfg          HostConfig
@@ -39,11 +61,13 @@ mut:
 	state        HostState
 	generation   int
 	ch           chan TranscribeResult
+	paste_ch     chan PasteResult
 	seg_threads  []thread
 	seg_mu       sync.Mutex
 	seg_texts    []string
 	seg_cursor   int
 	seg_active   bool
+	seg_closing  bool
 	seg_fail     int
 	last_use     f64
 	last_wav     string
@@ -55,6 +79,7 @@ fn new_host(cfg HostConfig) &Host {
 		cfg:      cfg
 		asr:      &AsrShim{}
 		ch:       chan TranscribeResult{cap: 4}
+		paste_ch: chan PasteResult{cap: 4}
 		state:    .idle
 		last_wav: '${cfg.data_dir}\\hexv-last.wav'
 	}
@@ -116,22 +141,81 @@ fn preload_worker(asr &AsrShim, model_path string, threads int, vad_path string)
 	asr.ensure_model(model_path, threads) or { hexv_log('preload: ${err}') }
 }
 
+// segment_worker polls on a deadline rather than sleeping a fixed 500 ms after
+// each poll. The old loop slept *after* the poll finished, so with 0.34-0.55 s
+// of inference the real cadence was 0.9-1.05 s and a forced cut at 6 s landed at
+// 6-7 s. It also slept before the first poll, which delayed the first checkpoint
+// of every take by a full interval.
+//
+// The wait is sliced so stop_segmenter() is not held hostage by it: a release
+// used to wait out whatever was left of the sleep, up to 500 ms, with nothing in
+// flight.
 fn segment_worker(mut h Host) {
+	mut next_poll := time.sys_mono_now()
 	for h.segmenter_running() {
-		time.sleep(seg_poll_ms * time.millisecond)
-		if !h.segmenter_running() {
-			break
-		}
 		h.segment_poll()
+		next_poll += time.Duration(seg_poll_ms) * time.millisecond
+		for h.segmenter_running() {
+			now := time.sys_mono_now()
+			if now >= next_poll {
+				break
+			}
+			remain := next_poll - now
+			if remain > 2 * time.millisecond {
+				time.sleep(2 * time.millisecond)
+			} else {
+				time.sleep(remain)
+			}
+		}
 	}
 }
 
+// segmenter_running reports whether the worker should start another poll. It
+// goes false as soon as stop_segmenter() begins closing, so no new poll starts,
+// but seg_active stays true so an inference already in flight still commits.
 fn (mut h Host) segmenter_running() bool {
 	h.seg_mu.lock()
 	defer {
 		h.seg_mu.unlock()
 	}
-	return h.seg_active
+	return h.seg_active && !h.seg_closing
+}
+
+// first_nonzero returns the index of the first non-silent sample. The GUI
+// records from the hotkey, so the first take after an idle unload begins with
+// the model-load window of exact digital zeros.
+fn first_nonzero(samples []f32) int {
+	for i, s in samples {
+		if s != 0.0 {
+			return i
+		}
+	}
+	return samples.len
+}
+
+// quietest_frame_end returns the sample just past the lowest-energy 20 ms frame
+// in [from, to), so a forced cut lands in the quietest part of the window rather
+// than in the middle of a word. Returns `to` when the window holds no whole
+// frame.
+fn quietest_frame_end(samples []f32, from int, to int) int {
+	if to - from < seg_frame_samples {
+		return to
+	}
+	mut best := from
+	mut best_energy := f32(-1.0)
+	mut i := from
+	for i + seg_frame_samples <= to {
+		mut acc := f32(0.0)
+		for s in samples[i..i + seg_frame_samples] {
+			acc += s * s
+		}
+		if best_energy < 0.0 || acc < best_energy {
+			best_energy = acc
+			best = i
+		}
+		i += seg_frame_samples
+	}
+	return best + seg_frame_samples
 }
 
 // segment_poll runs entirely on the segment worker: VAD, then inference. The
@@ -155,12 +239,47 @@ fn (mut h Host) segment_poll() {
 		return
 	}
 
+	if cursor == 0 {
+		// Skipping exact digital zeros is bit-safe and stops the model-load
+		// window being charged to the first segment and to the tail.
+		z := first_nonzero(sfx)
+		if z > 0 && z < sfx.len {
+			h.seg_mu.lock()
+			if h.seg_cursor == 0 {
+				h.seg_cursor = lo + z
+			}
+			cursor = h.seg_cursor
+			h.seg_mu.unlock()
+		}
+	}
+
 	t_vad := time.sys_mono_now()
-	rel_end := int(h.asr.vad_speech_end(sfx, seg_silence_ms))
+	mut rel_end := int(h.asr.vad_speech_end(sfx, seg_silence_ms))
 	vad_ms := f64(time.sys_mono_now() - t_vad) / 1_000_000.0
+	mut forced := false
 	if rel_end < 0 {
-		// -1 means no segment is closed yet: defer, do not retry/advance.
-		return
+		// No silence has closed a segment. Without this a monologue never
+		// checkpoints, because the cursor only moves on a closed segment and
+		// stop() then hands the whole remainder to one tail inference.
+		need := cursor + seg_force_cut_samples - lo
+		if need > 0 && sfx.len >= need {
+			mut from := need - seg_force_search_samples
+			floor := (cursor - lo) + seg_min_samples
+			if from < floor {
+				from = floor
+			}
+			if from < 0 {
+				from = 0
+			}
+			if from < need {
+				rel_end = quietest_frame_end(sfx, from, need)
+				forced = true
+			}
+		}
+		if !forced {
+			// No segment is closed yet: defer, do not retry/advance.
+			return
+		}
 	}
 	abs_end := lo + rel_end
 
@@ -214,7 +333,7 @@ fn (mut h Host) segment_poll() {
 		h.seg_fail = 0
 	}
 	h.seg_mu.unlock()
-	hexv_log('segment boundary: ${cursor}..${abs_end} (${abs_end - cursor} new samples) vad=${vad_ms:.0f} ms')
+	hexv_log('segment boundary: ${cursor}..${abs_end} (${abs_end - cursor} new samples) forced=${forced} vad=${vad_ms:.0f} ms')
 	hexv_log('segment: samples=${trimmed.len} trim=${trim_ms} ms inference=${elapsed:.0f} ms chars=${text.len}')
 }
 
@@ -243,6 +362,15 @@ fn tail_worker(asr &AsrShim, model_path string, threads int, language string,
 	}
 	result.infer_ms = infer_ms
 	result.text = text
+	if text.trim_space() == '' && prefix.len == 0 && trimmed.len >= seg_min_samples {
+		// A non-empty slice that transcribes to nothing is a broken shim or
+		// model, not silence. Surface it here instead of reporting an empty
+		// success that only dies later inside paste_text.
+		hexv_log('transcription empty: chars=0 samples=${trimmed.len} model=${model_path}')
+		result.err = 'no text returned for ${trimmed.len} samples'
+		ch <- result
+		return
+	}
 	if prefix.len > 0 {
 		mut parts := prefix.clone()
 		if text.len > 0 {
@@ -264,8 +392,10 @@ fn (mut h Host) start(now f64) ! {
 	}
 	h.stop_segmenter()
 	h.capture.start()!
-	h.generation++
 	h.seg_mu.lock()
+	// Bumped under seg_mu so take_generation() on a paste worker actually
+	// synchronizes with it, rather than relying on an atomic-enough store.
+	h.generation++
 	h.seg_texts.clear()
 	h.seg_cursor = 0
 	h.seg_fail = 0
@@ -288,14 +418,22 @@ fn (mut h Host) pump_level() f32 {
 
 // segment_tick is gone: the segment worker owns the 500 ms cadence, so the
 // paint thread never calls the VAD or waits on the shim lock.
+// stop_segmenter closes the worker without discarding work already in flight.
+// Cancelling seg_active outright used to drop the result of an inference that
+// had already called the shim, without advancing the cursor, so stop() then
+// re-transcribed that audio in the tail: a 0.55 s release could become ~1.8 s.
 fn (mut h Host) stop_segmenter() {
 	h.seg_mu.lock()
-	h.seg_active = false
+	h.seg_closing = true
 	h.seg_mu.unlock()
 	if h.seg_threads.len > 0 {
 		h.seg_threads.wait()
 		h.seg_threads.clear()
 	}
+	h.seg_mu.lock()
+	h.seg_active = false
+	h.seg_closing = false
+	h.seg_mu.unlock()
 }
 
 fn (mut h Host) stop(now f64) ! {
@@ -313,7 +451,7 @@ fn (mut h Host) stop(now f64) ! {
 	hexv_log('recording stopped: ${samples.len} samples (${f64(samples.len) / 16000.0:.2f} s) -> ${h.last_wav}')
 	h.seg_mu.lock()
 	prefix := h.seg_texts.clone()
-	cursor := h.seg_cursor
+	mut cursor := h.seg_cursor
 	h.seg_mu.unlock()
 	if samples.len < min_recording_samples {
 		h.state = .idle
@@ -329,12 +467,52 @@ fn (mut h Host) stop(now f64) ! {
 			return error('no speech detected')
 		}
 	}
+	if cursor == 0 {
+		z := first_nonzero(samples)
+		if z > 0 && z < samples.len {
+			cursor = z
+		}
+	}
 	tail := if cursor < samples.len { samples[cursor..].clone() } else { []f32{} }
 	h.state = .processing
 	h.busy = true
 	gen := h.generation
 	spawn tail_worker(h.asr, h.cfg.model_path(), h.cfg.threads, h.cfg.language, tail,
 		prefix, gen, h.ch)
+}
+
+// start_paste runs the clipboard/paste leg on a worker. It blocks for up to
+// about a second (modifier wait, clipboard round trip, 500 ms restore delay),
+// and running it on the paint thread froze the HUD and made keys.poll miss a
+// quick Ctrl+Space entirely.
+fn (mut h Host) start_paste(text string) {
+	spawn paste_worker(mut h, text, h.generation, h.paste_ch)
+}
+
+// take_generation reads the current take id under the segmenter lock, which is
+// the lock start()/cancel() already touch around a generation change.
+fn (mut h Host) take_generation() int {
+	h.seg_mu.lock()
+	defer {
+		h.seg_mu.unlock()
+	}
+	return h.generation
+}
+
+fn paste_worker(mut h Host, text string, generation int, ch chan PasteResult) {
+	mut r := PasteResult{
+		text:       text
+		generation: generation
+	}
+	// A paste that has not reached the clipboard yet is abandoned if the user
+	// has already started another take; the chord must not land in the new one.
+	if h.take_generation() != generation {
+		r.err = 'paste skipped: dictation superseded'
+		ch <- r
+		return
+	}
+	paste_text(text) or { r.err = err.msg() }
+	ch <- r
 }
 
 // poll returns a finished transcription and whether it still belongs to the
@@ -356,8 +534,17 @@ fn (mut h Host) poll(now f64) (TranscribeResult, bool) {
 }
 
 fn (mut h Host) cancel() {
-	h.generation++
 	h.stop_segmenter()
+	h.seg_mu.lock()
+	// Nothing consumes these on a cancel, and the next start() would clear them
+	// anyway; clearing here keeps the invariant local. The generation bump lives
+	// here for the same reason as in start(): take_generation() reads it under
+	// this lock.
+	h.generation++
+	h.seg_texts.clear()
+	h.seg_cursor = 0
+	h.seg_fail = 0
+	h.seg_mu.unlock()
 	match h.state {
 		.recording {
 			h.capture.cancel()
@@ -375,8 +562,15 @@ fn (mut h Host) cancel() {
 	}
 }
 
+// idle_check releases the model after a quiet spell. It must only fire when the
+// host is genuinely idle: `busy` is false for the whole of `.recording` (it is
+// set in stop() and cleared in poll()), so gating on `busy` alone released the
+// model - and re-enabled EcoQoS throttling - in the middle of any take longer
+// than idle_model_seconds(). Every later poll then deferred on the
+// `!is_loaded()` guard without advancing the cursor, so the rest of the take was
+// uncheckpointed and the tail paid for a fresh model load on the release path.
 fn (mut h Host) idle_check(now f64) {
-	if h.busy {
+	if h.state != .idle {
 		return
 	}
 	if h.asr.is_loaded() && now - h.last_use >= idle_model_seconds() {
@@ -407,6 +601,10 @@ fn run_transcribe_cli(wav_path string, model_override string, language_override 
 			eprintln('hexv: unknown model ${model_override}')
 			exit(1)
 		}
+	} else if cfg.config_error.len > 0 {
+		hexv_log('config error: ${cfg.config_error}')
+		eprintln('hexv: ${cfg.config_error}')
+		exit(1)
 	}
 	lang := if language_override.len > 0 { language_override } else { cfg.language }
 	samples := wav_read_mono16k(wav_path) or {
@@ -421,6 +619,12 @@ fn run_transcribe_cli(wav_path string, model_override string, language_override 
 	}
 	text, infer_ms := asr.transcribe(trimmed, lang) or {
 		eprintln('hexv: ${err}')
+		exit(1)
+	}
+	if text.trim_space() == '' && trimmed.len > 0 {
+		hexv_log('cli: transcription empty: chars=0 samples=${trimmed.len} model=${cfg.model_id}')
+		eprintln('hexv: transcribe returned no text (${trimmed.len} samples, ${cfg.model_id})')
+		asr.close_all()
 		exit(1)
 	}
 	hexv_log('cli: model=${load_ms:.0f} ms inference=${infer_ms:.0f} ms samples=${trimmed.len} trim=${trim_ms} ms threads=${asr_worker_threads(cfg.threads)}')
@@ -454,6 +658,11 @@ fn run_record_cli(seconds f64, out_path string) {
 
 fn run_paste_cli(wav_path string) {
 	cfg := host_config()
+	if cfg.config_error.len > 0 {
+		hexv_log('config error: ${cfg.config_error}')
+		eprintln('hexv: ${cfg.config_error}')
+		exit(1)
+	}
 	samples := wav_read_mono16k(wav_path) or {
 		eprintln('hexv: ${err}')
 		exit(1)

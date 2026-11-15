@@ -94,6 +94,10 @@ fn (mut m Indicator) show_pipeline(now f64) {
 fn (mut m Indicator) on_started(now f64, reduce bool) {
 	m.demo_voice = false
 	m.capturing = true
+	// A new take starts with no outstanding jobs: without this, a paste or
+	// completion result left over from the previous take satisfies
+	// on_completed() and ends this take's HUD early.
+	m.pending_jobs = 0
 	m.phase = .recording
 	m.phase_started = now
 	m.completion_pending = false

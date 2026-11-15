@@ -77,15 +77,18 @@ mut:
 
 struct HostConfig {
 mut:
-	model_id    string
-	model_file  string
-	language    string
-	paste_keys  string
-	threads     int
-	engine      string
-	data_dir    string
-	models_dir  string
-	logs_dir    string
+	model_id     string
+	model_file   string
+	language     string
+	paste_keys   string
+	threads      int
+	data_dir     string
+	models_dir   string
+	logs_dir     string
+	// config_error names an odin-config value this build cannot honour. It is a
+	// field rather than an error return so hexv_log(), which calls this to find
+	// logs_dir, cannot recurse through the failure path.
+	config_error string
 }
 
 struct PowerThrottlingState {
@@ -109,7 +112,6 @@ fn host_config() HostConfig {
 		model_file: 'phonon-2.5-en-Q8_0.gguf'
 		language:   'en'
 		paste_keys: 'ctrl_v'
-		engine:     'auto'
 		data_dir:   data_dir
 		models_dir: '${data_dir}\\models'
 		logs_dir:   '${data_dir}\\logs'
@@ -127,12 +129,18 @@ fn host_config() HostConfig {
 			'language' { c.language = val }
 			'paste_keys' { c.paste_keys = val }
 			'threads' { c.threads = val.int() }
-			'engine' { c.engine = val }
+			// 'engine' is an odin-hex knob. hex-v has exactly one engine (the
+			// transcribe shim), so the value was parsed and never read; it is
+			// ignored rather than pretended to do something.
 			else {}
 		}
 	}
 	c.model_file = model_filename(c.model_id)
 	if c.model_file.len == 0 {
+		// Fail loudly at the call sites instead of loading phonon while the
+		// config still names something else. Keep the default populated so
+		// hexv_log() and error paths still have a usable logs_dir/model.
+		c.config_error = 'unsupported model "${c.model_id}" in odin-config; this build supports: ${supported_models()}'
 		c.model_id = 'phonon25_en'
 		c.model_file = 'phonon-2.5-en-Q8_0.gguf'
 	}
@@ -142,12 +150,17 @@ fn host_config() HostConfig {
 	return c
 }
 
+// model_filename maps the only model id hex-v can load. Anything else returns
+// '' so host_config() can report it instead of silently substituting phonon.
 fn model_filename(id string) string {
 	return match id {
 		'phonon25_en' { 'phonon-2.5-en-Q8_0.gguf' }
-		'canary-180m-flash' { 'canary-180m-flash-Q8_0.gguf' }
 		else { '' }
 	}
+}
+
+fn supported_models() string {
+	return 'phonon25_en'
 }
 
 fn (c &HostConfig) model_path() string {
