@@ -482,6 +482,14 @@ fn build_scene(f DotFrame) render.Scene {
 // run_window shows the real dictation host: Ctrl+Space starts/stops,
 // Ctrl+Alt+Q quits, Esc cancels only while dictating/transcribing.
 pub fn run_window() {
+	// Validate before hiding the console: otherwise a config error would be
+	// printed to a window nobody can see and the HUD simply would not appear.
+	cfg := host_config()
+	if cfg.config_error.len > 0 {
+		hexv_log('config error: ${cfg.config_error}')
+		eprintln('hexv: ${cfg.config_error}')
+		return
+	}
 	C.ShowWindow(C.GetConsoleWindow(), sw_hide)
 	mut surface := layered_surface_open(true) or {
 		eprintln('hexv: ${err}')
@@ -490,7 +498,7 @@ pub fn run_window() {
 	C.timeBeginPeriod(1)
 	mut clock := paint_clock_new()
 	mut indicator := indicator_new(tuning_default())
-	mut host := new_host(host_config())
+	mut host := new_host(cfg)
 	mut keys := KeyPoll{}
 	mut msg := W32Msg{}
 	mut last_step := clock.seconds()

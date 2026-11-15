@@ -601,6 +601,10 @@ fn run_transcribe_cli(wav_path string, model_override string, language_override 
 			eprintln('hexv: unknown model ${model_override}')
 			exit(1)
 		}
+	} else if cfg.config_error.len > 0 {
+		hexv_log('config error: ${cfg.config_error}')
+		eprintln('hexv: ${cfg.config_error}')
+		exit(1)
 	}
 	lang := if language_override.len > 0 { language_override } else { cfg.language }
 	samples := wav_read_mono16k(wav_path) or {
@@ -654,6 +658,11 @@ fn run_record_cli(seconds f64, out_path string) {
 
 fn run_paste_cli(wav_path string) {
 	cfg := host_config()
+	if cfg.config_error.len > 0 {
+		hexv_log('config error: ${cfg.config_error}')
+		eprintln('hexv: ${cfg.config_error}')
+		exit(1)
+	}
 	samples := wav_read_mono16k(wav_path) or {
 		eprintln('hexv: ${err}')
 		exit(1)
