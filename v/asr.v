@@ -145,7 +145,6 @@ fn host_config() HostConfig {
 fn model_filename(id string) string {
 	return match id {
 		'phonon25_en' { 'phonon-2.5-en-Q8_0.gguf' }
-		'canary-180m-flash' { 'canary-180m-flash-Q8_0.gguf' }
 		else { '' }
 	}
 }
