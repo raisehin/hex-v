@@ -408,6 +408,9 @@ fn (mut s AsrShim) close_all() {
 	}
 }
 
+// idle_model_seconds is opt-in. An unset or non-positive HEX_MODEL_IDLE_SECS
+// keeps the already-loaded model resident, so an idle HUD never creates the
+// next take's cold-load outlier.
 fn idle_model_seconds() f64 {
 	v := os.getenv('HEX_MODEL_IDLE_SECS')
 	if v.len > 0 {
@@ -416,5 +419,5 @@ fn idle_model_seconds() f64 {
 			return f64(n)
 		}
 	}
-	return 180.0
+	return 0.0
 }

@@ -42,6 +42,11 @@ mut:
 	generation int
 }
 
+struct PastePrepared {
+	generation int
+	prep       PastePrep
+}
+
 // PasteResult carries the outcome of the clipboard/paste leg back to the paint
 // thread, which polls for it instead of blocking on it. generation lets the
 // paint thread and the worker itself drop a paste that belongs to a take the
@@ -62,6 +67,7 @@ mut:
 	generation   int
 	ch           chan TranscribeResult
 	paste_ch     chan PasteResult
+	paste_prep_ch chan PastePrepared
 	seg_threads  []thread
 	seg_mu       sync.Mutex
 	seg_texts    []string
@@ -69,6 +75,7 @@ mut:
 	seg_active   bool
 	seg_closing  bool
 	seg_fail     int
+	seg_saw_speech bool
 	last_use     f64
 	last_wav     string
 	busy         bool
@@ -80,6 +87,7 @@ fn new_host(cfg HostConfig) &Host {
 		asr:      &AsrShim{}
 		ch:       chan TranscribeResult{cap: 4}
 		paste_ch: chan PasteResult{cap: 4}
+		paste_prep_ch: chan PastePrepared{cap: 2}
 		state:    .idle
 		last_wav: '${cfg.data_dir}\\hexv-last.wav'
 	}
@@ -139,6 +147,7 @@ fn trim_trailing_silence(samples []f32) ([]f32, int) {
 fn preload_worker(asr &AsrShim, model_path string, threads int, vad_path string) {
 	asr.ensure_vad(vad_path) or { hexv_log('preload: ${err}') }
 	asr.ensure_model(model_path, threads) or { hexv_log('preload: ${err}') }
+	hexv_log('startup: model preload complete')
 }
 
 // segment_worker polls on a deadline rather than sleeping a fixed 500 ms after
@@ -227,6 +236,12 @@ fn (mut h Host) segment_poll() {
 	mut cursor := h.seg_cursor
 	h.seg_mu.unlock()
 
+	// Do not snapshot or VAD while the model is still loading. The cursor is
+	// deliberately left untouched, so this audio remains for the tail.
+	if !h.asr.is_loaded() {
+		return
+	}
+
 	mut lo := cursor - vad_ctx_samples
 	if lo < 0 {
 		lo = 0
@@ -255,6 +270,11 @@ fn (mut h Host) segment_poll() {
 
 	t_vad := time.sys_mono_now()
 	mut rel_end := int(h.asr.vad_speech_end(sfx, seg_silence_ms))
+	if rel_end >= 0 {
+		h.seg_mu.lock()
+		h.seg_saw_speech = true
+		h.seg_mu.unlock()
+	}
 	vad_ms := f64(time.sys_mono_now() - t_vad) / 1_000_000.0
 	mut forced := false
 	if rel_end < 0 {
@@ -301,12 +321,6 @@ fn (mut h Host) segment_poll() {
 	if rel_end <= slice_start || rel_end > sfx.len {
 		return
 	}
-	// If the session is not open yet, leave this audio for the tail instead of
-	// spinning on the same span.
-	if !h.asr.is_loaded() {
-		return
-	}
-
 	slice := sfx[slice_start..rel_end]
 	trimmed, trim_ms := trim_trailing_silence(slice)
 	t_infer := time.sys_mono_now()
@@ -391,6 +405,7 @@ fn (mut h Host) start(now f64) ! {
 		return error('model busy')
 	}
 	h.stop_segmenter()
+	h.paste_prep_ch = chan PastePrepared{cap: 2}
 	h.capture.start()!
 	h.seg_mu.lock()
 	// Bumped under seg_mu so take_generation() on a paste worker actually
@@ -399,13 +414,15 @@ fn (mut h Host) start(now f64) ! {
 	h.seg_texts.clear()
 	h.seg_cursor = 0
 	h.seg_fail = 0
+	h.seg_saw_speech = false
 	h.seg_active = true
 	h.seg_mu.unlock()
 	h.seg_threads << spawn segment_worker(mut h)
 	h.state = .recording
 	power_eco(false)
-	spawn preload_worker(h.asr, h.cfg.model_path(), h.cfg.threads, h.cfg.vad_path())
-	hexv_log('listening: model preload started')
+	if !h.asr.is_loaded() {
+		hexv_log('listening: model preload still in progress')
+	}
 }
 
 fn (mut h Host) pump_level() f32 {
@@ -418,14 +435,18 @@ fn (mut h Host) pump_level() f32 {
 
 // segment_tick is gone: the segment worker owns the 500 ms cadence, so the
 // paint thread never calls the VAD or waits on the shim lock.
-// stop_segmenter closes the worker without discarding work already in flight.
-// Cancelling seg_active outright used to drop the result of an inference that
-// had already called the shim, without advancing the cursor, so stop() then
-// re-transcribed that audio in the tail: a 0.55 s release could become ~1.8 s.
-fn (mut h Host) stop_segmenter() {
+// stop_segmenter_begin closes the worker to new polls without joining an
+// inference already in flight. capture.stop() takes the capture mutex that
+// snapshot_16k_from also holds and returns an owned immutable take, so the
+// in-flight worker cannot see the cleared capture buffer. stop_segmenter_finish
+// is called after WAV write and only then is the cursor/prefix read.
+fn (mut h Host) stop_segmenter_begin() {
 	h.seg_mu.lock()
 	h.seg_closing = true
 	h.seg_mu.unlock()
+}
+
+fn (mut h Host) stop_segmenter_finish() {
 	if h.seg_threads.len > 0 {
 		h.seg_threads.wait()
 		h.seg_threads.clear()
@@ -436,29 +457,42 @@ fn (mut h Host) stop_segmenter() {
 	h.seg_mu.unlock()
 }
 
+fn (mut h Host) stop_segmenter() {
+	h.stop_segmenter_begin()
+	h.stop_segmenter_finish()
+}
+
 fn (mut h Host) stop(now f64) ! {
 	if h.state != .recording {
 		return error('not recording')
 	}
-	// Join the segmenter before tearing down capture: the worker reads the
-	// capture buffer, so stopping first could let it snapshot a cleared take.
-	h.stop_segmenter()
-	samples := h.capture.stop()!
+	h.stop_segmenter_begin()
+	samples := h.capture.stop() or {
+		err_text := err.msg()
+		h.stop_segmenter_finish()
+		return error(err_text)
+	}
 	h.last_use = now
 	wav_write_f32(h.last_wav, samples, 16000) or {
 		hexv_log('could not save last recording: ${err}')
 	}
 	hexv_log('recording stopped: ${samples.len} samples (${f64(samples.len) / 16000.0:.2f} s) -> ${h.last_wav}')
+	// The worker may still be committing the segment that was in flight at
+	// capture stop; read seg_cursor and seg_texts only after that commit.
+	h.stop_segmenter_finish()
 	h.seg_mu.lock()
 	prefix := h.seg_texts.clone()
 	mut cursor := h.seg_cursor
+	saw_speech := h.seg_saw_speech
 	h.seg_mu.unlock()
 	if samples.len < min_recording_samples {
 		h.state = .idle
 		power_eco(true)
 		return error('recording too short (${samples.len} samples)')
 	}
-	if prefix.len == 0 {
+	// A closed VAD segment is proof that speech was seen; only an unknown or
+	// negative cached verdict pays for the whole-take rescan.
+	if prefix.len == 0 && !saw_speech {
 		mut vad_ok := true
 		h.asr.ensure_vad(h.cfg.vad_path()) or { vad_ok = false }
 		if vad_ok && !h.asr.vad_has_speech(samples) {
@@ -479,14 +513,19 @@ fn (mut h Host) stop(now f64) ! {
 	gen := h.generation
 	spawn tail_worker(h.asr, h.cfg.model_path(), h.cfg.threads, h.cfg.language, tail,
 		prefix, gen, h.ch)
+	// Snapshot the old clipboard and wait for modifiers while the tail infers.
+	spawn paste_prepare_worker(gen, h.paste_prep_ch)
 }
 
-// start_paste runs the clipboard/paste leg on a worker. It blocks for up to
-// about a second (modifier wait, clipboard round trip, 500 ms restore delay),
-// and running it on the paint thread froze the HUD and made keys.poll miss a
-// quick Ctrl+Space entirely.
-fn (mut h Host) start_paste(text string) {
-	spawn paste_worker(mut h, text, h.generation, h.paste_ch)
+// start_paste runs the clipboard/paste leg on a worker. Snapshotting the old
+// clipboard and the modifier wait already overlap the tail; running the rest
+// on a worker keeps the paint loop polling keys.
+fn (mut h Host) start_paste(text string, generation int) {
+	spawn paste_worker(mut h, text, generation, h.paste_ch, h.paste_prep_ch)
+}
+
+fn paste_prepare_worker(generation int, ch chan PastePrepared) {
+	ch <- PastePrepared{generation: generation, prep: paste_prepare()}
 }
 
 // take_generation reads the current take id under the segmenter lock, which is
@@ -499,7 +538,7 @@ fn (mut h Host) take_generation() int {
 	return h.generation
 }
 
-fn paste_worker(mut h Host, text string, generation int, ch chan PasteResult) {
+fn paste_worker(mut h Host, text string, generation int, ch chan PasteResult, prep_ch chan PastePrepared) {
 	mut r := PasteResult{
 		text:       text
 		generation: generation
@@ -511,7 +550,21 @@ fn paste_worker(mut h Host, text string, generation int, ch chan PasteResult) {
 		ch <- r
 		return
 	}
-	paste_text(text) or { r.err = err.msg() }
+	mut prep := PastePrep{}
+	for {
+		mut candidate := PastePrepared{}
+		if prep_ch.try_pop(mut candidate) != .success {
+			break
+		}
+		if candidate.generation == generation {
+			prep = candidate.prep
+			break
+		}
+	}
+	if !prep.valid {
+		prep = paste_prepare()
+	}
+	paste_finish(text, paste_mode(), mut prep) or { r.err = err.msg() }
 	ch <- r
 }
 
@@ -573,7 +626,8 @@ fn (mut h Host) idle_check(now f64) {
 	if h.state != .idle {
 		return
 	}
-	if h.asr.is_loaded() && now - h.last_use >= idle_model_seconds() {
+	limit := idle_model_seconds()
+	if limit > 0.0 && h.asr.is_loaded() && now - h.last_use >= limit {
 		h.asr.close_model()
 		power_eco(true)
 	}

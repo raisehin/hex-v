@@ -151,7 +151,7 @@ sits next to the exe. It does not copy the model or reimplement ASR.
   transcript is pasted with clipboard save/restore;
 - the last recording is saved to `%APPDATA%\hex\hexv-last.wav`;
 - model load and inference timings are in `%APPDATA%\hex\logs\hexv.log`;
-- the model is released after 180 s idle (`HEX_MODEL_IDLE_SECS` overrides).
+- the model is warmed once at HUD startup and stays resident by default; set `HEX_MODEL_IDLE_SECS` to a positive number of seconds to opt into idle release.
 
 `%APPDATA%\hex\odin-config`, read at startup:
 
@@ -184,11 +184,10 @@ Release to text is therefore **about 0.55-0.60 s**: 535 ms of tail inference,
 then the clipboard write and `SendInput` chord (tens of ms, not logged). Two
 things that are easy to get wrong:
 
-- the `pasted` line is written *after* `paste_restore_delay_ms` (`paste.v:27`)
-  has slept 500 ms following the chord, so it is not the text-arrival time;
-  differencing it against `recording stopped` invents a delay nobody waits for;
-- `paste_wait_for_modifiers` (`paste.v:28`) can add up to 500 ms *before* the
-  chord, but only when Ctrl is still held once the tail finishes.
+- the `pasted` line is written when the chord is sent; the 500 ms
+  `paste_restore_delay_ms` (`paste.v:27`) then runs before clipboard restore;
+- the modifier wait is capped at 100 ms (`paste.v:28`) and overlaps the tail,
+  so a Ctrl still held at release no longer adds a separate 500 ms delay.
 
 Same build and WAV through the CLI: `inference 2085-2476 ms` for
 `samples=154529`, i.e. 216-256 ms per second of audio (per-second figures here
@@ -197,13 +196,13 @@ coefficient is not a constant: this take's 1.47 s tail runs at 364 ms/s, and a
 30 s take at 220 ms/s (`inference 6603 ms … samples=480000`), because fixed
 encoder cost dominates a short slice.
 
-Shipped from the speed-up work, all in `v/host.v`: a segment already in flight
-at release commits instead of being dropped and re-transcribed by the tail; the
-clipboard/paste leg runs on a worker, so the paint loop keeps polling keys;
-`seg_poll_ms` 100, `seg_silence_ms` 300 and a 3 s forced-cut ceiling;
-exact leading zeros are skipped before inference; and an
-empty transcript over real audio is logged and surfaced as a failure rather
-than a silent success.
+Shipped from the speed-up work: the model, shim and VAD are warmed once after
+the HUD and tray are up; a segment already in flight at release commits instead
+of being dropped and re-transcribed by the tail; the clipboard/paste leg runs on
+a worker, so the paint loop keeps polling keys; `seg_poll_ms` 100,
+`seg_silence_ms` 300 and a 3 s forced-cut ceiling; exact leading zeros are
+skipped before inference; and an empty transcript over real audio is logged and
+surfaced as a failure rather than a silent success.
 
 Blocked, with the measurement that blocks it: **canary-180m-flash** loads in
 197 ms and runs at 70-111 ms per second of audio (`inference 679 ms …

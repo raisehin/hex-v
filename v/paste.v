@@ -25,7 +25,7 @@ const paste_vk_v = u16(0x56)
 const paste_vk_insert = u16(0x2D)
 const paste_key_down_mask = 0x8000
 const paste_restore_delay_ms = 500
-const paste_wait_modifiers_ms = 500
+const paste_wait_modifiers_ms = 100
 const cp_utf8 = u32(65001)
 const mb_err_invalid_chars = u32(8)
 const cf_unicodetext = u32(13)
@@ -234,7 +234,34 @@ fn paste_restore_text(mut cb &clipboard.Clipboard, old_text string, old_had_text
 	}
 }
 
-fn paste_text(text string) ! {
+struct PastePrep {
+	valid        bool
+	old_text     string
+	old_had_text bool
+	non_text     bool
+	old_seq      u32
+}
+
+// paste_prepare snapshots the previous clipboard while the tail infers.
+fn paste_prepare() PastePrep {
+	paste_wait_for_modifiers()
+	mut cb := clipboard.new()
+	defer {
+		cb.destroy()
+	}
+	old_text := cb.paste()
+	return PastePrep{
+		valid:        true
+		old_text:     old_text
+		old_had_text: old_text != ''
+		non_text:     old_text == '' && C.CountClipboardFormats() > 0
+		old_seq:      C.GetClipboardSequenceNumber()
+	}
+}
+
+// paste_finish only writes the clipboard and sends the chord; the 500 ms
+// restore delay stays in paste_text after this returns.
+fn paste_finish(text string, mode PasteMode, mut prep PastePrep) ! {
 	mut payload, fixups := sanitize_transcript(text)
 	payload = payload.trim_space()
 	if payload == '' {
@@ -243,39 +270,43 @@ fn paste_text(text string) ! {
 	if fixups > 0 {
 		hexv_log('paste: repaired ${fixups} undecodable/control byte(s)')
 	}
-	mode := paste_mode()
 	if mode == .type {
-		paste_wait_for_modifiers()
 		if !type_text(payload) {
 			return error('paste_text: SendInput rejected typed text')
 		}
 		hexv_log('pasted ${payload.len} chars via type')
 		return
 	}
-	paste_wait_for_modifiers()
+	// The user may have copied something while the tail inferred. Refresh the
+	// snapshot in that case instead of overwriting their newer clipboard.
+	if prep.valid && C.GetClipboardSequenceNumber() != prep.old_seq {
+		hexv_log('paste: clipboard changed during tail, refreshing snapshot')
+		prep = paste_prepare()
+	}
 	mut cb := clipboard.new()
 	defer {
 		cb.destroy()
 	}
-	old_text := cb.paste()
-	old_had_text := old_text != ''
-	non_text := !old_had_text && C.CountClipboardFormats() > 0
-	old_seq := C.GetClipboardSequenceNumber()
 	if !cb.copy(payload) {
 		return error('paste_text: could not put the transcript on the clipboard')
 	}
 	clip_seq := C.GetClipboardSequenceNumber()
-	if clip_seq == old_seq {
+	if prep.valid && clip_seq == prep.old_seq {
 		return error('paste_text: the clipboard write did not take effect')
 	}
-	if non_text {
+	if prep.non_text {
 		hexv_log('paste: replacing non-restorable clipboard content')
 	}
 	if !send_paste_chord(mode) {
-		paste_restore_text(mut cb, old_text, old_had_text, clip_seq)
+		paste_restore_text(mut cb, prep.old_text, prep.old_had_text, clip_seq)
 		return error('paste_text: SendInput rejected the paste chord')
 	}
-	time.sleep(paste_restore_delay_ms * time.millisecond)
-	paste_restore_text(mut cb, old_text, old_had_text, clip_seq)
 	hexv_log('pasted ${payload.len} chars via ${mode}')
+	time.sleep(paste_restore_delay_ms * time.millisecond)
+	paste_restore_text(mut cb, prep.old_text, prep.old_had_text, clip_seq)
+}
+
+fn paste_text(text string) ! {
+	mut prep := paste_prepare()
+	paste_finish(text, paste_mode(), mut prep)!
 }

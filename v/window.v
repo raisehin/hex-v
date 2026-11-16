@@ -552,6 +552,10 @@ pub fn run_window() {
 	mut clock := paint_clock_new()
 	mut indicator := indicator_new(tuning_default())
 	mut host := new_host(cfg)
+	// The HUD and tray are ready; warm the shim/VAD/model once for this process.
+	// The take's Ctrl+Space path must never own the 1.1 s cold-load cost.
+	hexv_log('startup: model preload started')
+	spawn preload_worker(host.asr, host.cfg.model_path(), host.cfg.threads, host.cfg.vad_path())
 	mut keys := KeyPoll{}
 	mut msg := W32Msg{}
 	mut last_step := clock.seconds()
@@ -613,7 +617,7 @@ pub fn run_window() {
 				// Off the paint thread: the paste leg can block for ~1 s, and
 				// blocking here froze the HUD and made keys.poll miss a quick
 				// Ctrl+Space tap entirely.
-				host.start_paste(result.text)
+				host.start_paste(result.text, result.generation)
 			}
 		} else if result.generation != 0 {
 			hexv_log('transcription discarded')
