@@ -69,6 +69,7 @@ mut:
 	seg_active   bool
 	seg_closing  bool
 	seg_fail     int
+	seg_saw_speech bool
 	last_use     f64
 	last_wav     string
 	busy         bool
@@ -262,6 +263,11 @@ fn (mut h Host) segment_poll() {
 
 	t_vad := time.sys_mono_now()
 	mut rel_end := int(h.asr.vad_speech_end(sfx, seg_silence_ms))
+	if rel_end >= 0 {
+		h.seg_mu.lock()
+		h.seg_saw_speech = true
+		h.seg_mu.unlock()
+	}
 	vad_ms := f64(time.sys_mono_now() - t_vad) / 1_000_000.0
 	mut forced := false
 	if rel_end < 0 {
@@ -400,6 +406,7 @@ fn (mut h Host) start(now f64) ! {
 	h.seg_texts.clear()
 	h.seg_cursor = 0
 	h.seg_fail = 0
+	h.seg_saw_speech = false
 	h.seg_active = true
 	h.seg_mu.unlock()
 	h.seg_threads << spawn segment_worker(mut h)
@@ -454,13 +461,16 @@ fn (mut h Host) stop(now f64) ! {
 	h.seg_mu.lock()
 	prefix := h.seg_texts.clone()
 	mut cursor := h.seg_cursor
+	saw_speech := h.seg_saw_speech
 	h.seg_mu.unlock()
 	if samples.len < min_recording_samples {
 		h.state = .idle
 		power_eco(true)
 		return error('recording too short (${samples.len} samples)')
 	}
-	if prefix.len == 0 {
+	// A closed VAD segment is proof that speech was seen; only an unknown or
+	// negative cached verdict pays for the whole-take rescan.
+	if prefix.len == 0 && !saw_speech {
 		mut vad_ok := true
 		h.asr.ensure_vad(h.cfg.vad_path()) or { vad_ok = false }
 		if vad_ok && !h.asr.vad_has_speech(samples) {
