@@ -6,7 +6,10 @@ import sync
 import time
 
 const min_recording_samples = 3200 // 0.2 s at 16 kHz
-const seg_min_samples = 16000
+// A shorter minimum lets the frozen 300 ms silence window commit 0.5 s
+// checkpoints during speech, shrinking the release tail. It does not change
+// seg_silence_ms (v/host.v:15) or the shipped forced-cut cap.
+const seg_min_samples = 8000 // 0.5 s at 16 kHz
 const seg_ctx_samples = 3200
 const vad_ctx_samples = 16384
 // A short poll and silence window leave less uncheckpointed audio behind at
