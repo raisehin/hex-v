@@ -552,6 +552,10 @@ pub fn run_window() {
 	mut clock := paint_clock_new()
 	mut indicator := indicator_new(tuning_default())
 	mut host := new_host(cfg)
+	// The HUD and tray are ready; warm the shim/VAD/model once for this process.
+	// The take's Ctrl+Space path must never own the 1.1 s cold-load cost.
+	hexv_log('startup: model preload started')
+	spawn preload_worker(host.asr, host.cfg.model_path(), host.cfg.threads, host.cfg.vad_path())
 	mut keys := KeyPoll{}
 	mut msg := W32Msg{}
 	mut last_step := clock.seconds()
