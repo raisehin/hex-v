@@ -91,7 +91,7 @@ fn (mut m Indicator) show_pipeline(now f64) {
 	}
 }
 
-fn (mut m Indicator) on_started(now f64, reduce bool) {
+fn (mut m Indicator) on_started(now f64) {
 	m.demo_voice = false
 	m.capturing = true
 	// A new take starts with no outstanding jobs: without this, a paste or
@@ -219,7 +219,7 @@ fn run_replay(out_dir string) {
 		now := f64(t)
 		for ev_i < events.len && events[ev_i].at <= now {
 			match events[ev_i].kind {
-				'started' { m.on_started(now, false) }
+				'started' { m.on_started(now) }
 				'submitted' { m.on_submitted(now) }
 				'processing' { m.show_pipeline(now) }
 				'completed' { m.on_completed(now) }

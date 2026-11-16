@@ -231,7 +231,9 @@ mut:
 // begin starts a phrase and hands the loudness curve to the indicator:
 // on_started clears demo_voice, so it is set again right after.
 fn (mut phrase DemoPhrase) begin(mut indicator Indicator, now f64, reduce bool) {
-	indicator.on_started(now, reduce)
+	// Intentionally unused: begin/tick keep the reduce shape for replay callers.
+	_ = reduce
+	indicator.on_started(now)
 	indicator.demo_voice = true
 	indicator.demo_time = 0
 	phrase.started = now
@@ -595,7 +597,7 @@ pub fn run_window() {
 							indicator.on_failed(now)
 						}
 						if host.state == .recording {
-							indicator.on_started(now, false)
+							indicator.on_started(now)
 							indicator.demo_voice = false
 						}
 					}

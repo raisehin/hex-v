@@ -28,7 +28,6 @@ const paste_restore_delay_ms = 500
 const paste_wait_modifiers_ms = 100
 const cp_utf8 = u32(65001)
 const mb_err_invalid_chars = u32(8)
-const cf_unicodetext = u32(13)
 
 enum PasteMode {
 	ctrl_v
