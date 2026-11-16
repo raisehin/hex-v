@@ -193,7 +193,9 @@ fn asr_worker_threads(want int) int {
 	return n - n / 4
 }
 
-// set_transcribe_priority raises the process only for the inference burst.
+// set_transcribe_priority raises the process for a single transcribe call.
+// Standalone CLI calls use it directly. The HUD host holds the boost across the
+// whole release path and re-applies it after each transcribe returns.
 fn set_transcribe_priority(elevated bool) {
 	cls := if elevated { above_normal_priority_class } else { normal_priority_class }
 	C.SetPriorityClass(C.GetCurrentProcess(), cls)
