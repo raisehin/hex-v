@@ -49,6 +49,15 @@ type HexSetThreads = fn (n i32)
 type HexVoid = fn ()
 type HexLastError = fn () &char
 
+struct LogState {
+mut:
+	mu      sync.Mutex
+	ch      chan string
+	started bool
+}
+
+__global log_state = LogState{}
+
 fn C.GetCurrentProcess() voidptr
 fn C.SetPriorityClass(process voidptr, class u32) i32
 fn C.SetProcessInformation(process voidptr, class i32, info voidptr, size u32) i32
@@ -173,14 +182,33 @@ fn (c &HostConfig) vad_path() string {
 	return '${c.models_dir}\\${vad_filename}'
 }
 
-// hexv_log appends one line to %APPDATA%\hex\logs\hexv.log.
-fn hexv_log(msg string) {
+// log_worker owns the only file handle and appends queued lines in order.
+// host_config is read once here, not once per log line.
+fn log_worker() {
 	c := host_config()
 	os.mkdir_all(c.logs_dir) or {}
-	path := '${c.logs_dir}\\hexv.log'
-	old := os.read_file(path) or { '' }
-	stamp := time.now().str()
-	os.write_file(path, '${old}[${stamp}] ${msg}\n') or {}
+	mut f := os.open_file('${c.logs_dir}\\hexv.log', 'ab') or { return }
+	defer {
+		f.close()
+	}
+	for {
+		line := <-log_state.ch or { break }
+		f.write_string(line) or {}
+	}
+}
+
+// hexv_log enqueues a timestamped line. The worker appends it with a single
+// write instead of reading and rewriting the whole log on every call.
+fn hexv_log(msg string) {
+	log_state.mu.lock()
+	if !log_state.started {
+		log_state.ch = chan string{cap: 4096}
+		log_state.started = true
+		spawn log_worker()
+	}
+	ch := log_state.ch
+	log_state.mu.unlock()
+	ch <- '[${time.now().str()}] ${msg}\n'
 }
 
 // asr_worker_threads: 0 means three quarters of the logical CPUs, leaving one

@@ -26,7 +26,7 @@ V 0.5.2 source (`f9ebca4`), builds V's own bootstrap snapshot with gcc, and
 uses that to compile the pinned compiler before building the app. It runs:
 
 ```powershell
-v -prod -cc gcc -cflags "-ffp-contract=off" -o v/bin/hexv.exe v
+v -prod -enable-globals -cc gcc -cflags "-ffp-contract=off" -o v/bin/hexv.exe v
 ```
 
 `SOURCE_DATE_EPOCH=0` is set for the linker so two clean builds of the same
