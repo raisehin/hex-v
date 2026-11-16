@@ -13,6 +13,7 @@ fn main() {
 		'exstyle' { run_exstyle_probe() }
 		'tray-probe' { run_tray_probe() }
 		'paint-probe' { run_paint_pacing() }
+		'models' { run_provision_cli(if os.args.len > 2 { os.args[2..] } else { []string{} }) }
 		'transcribe' {
 			if os.args.len < 3 {
 				println('usage: hexv transcribe <file.wav> [model] [language]')
@@ -39,7 +40,7 @@ fn main() {
 			run_paste_cli(os.args[2])
 		}
 		else {
-			println('usage: hexv [run|replay [dir]|render [dir]|probe|paint-probe|tray-probe|transcribe <wav>|record <sec> <wav>|paste-file <wav>]')
+			println('usage: hexv [run|replay [dir]|render [dir]|probe|paint-probe|tray-probe|models [check|install]|transcribe <wav>|record <sec> <wav>|paste-file <wav>]')
 		}
 	}
 }
