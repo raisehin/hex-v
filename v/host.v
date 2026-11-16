@@ -418,14 +418,18 @@ fn (mut h Host) pump_level() f32 {
 
 // segment_tick is gone: the segment worker owns the 500 ms cadence, so the
 // paint thread never calls the VAD or waits on the shim lock.
-// stop_segmenter closes the worker without discarding work already in flight.
-// Cancelling seg_active outright used to drop the result of an inference that
-// had already called the shim, without advancing the cursor, so stop() then
-// re-transcribed that audio in the tail: a 0.55 s release could become ~1.8 s.
-fn (mut h Host) stop_segmenter() {
+// stop_segmenter_begin closes the worker to new polls without joining an
+// inference already in flight. capture.stop() takes the capture mutex that
+// snapshot_16k_from also holds and returns an owned immutable take, so the
+// in-flight worker cannot see the cleared capture buffer. stop_segmenter_finish
+// is called after WAV write and only then is the cursor/prefix read.
+fn (mut h Host) stop_segmenter_begin() {
 	h.seg_mu.lock()
 	h.seg_closing = true
 	h.seg_mu.unlock()
+}
+
+fn (mut h Host) stop_segmenter_finish() {
 	if h.seg_threads.len > 0 {
 		h.seg_threads.wait()
 		h.seg_threads.clear()
@@ -436,19 +440,29 @@ fn (mut h Host) stop_segmenter() {
 	h.seg_mu.unlock()
 }
 
+fn (mut h Host) stop_segmenter() {
+	h.stop_segmenter_begin()
+	h.stop_segmenter_finish()
+}
+
 fn (mut h Host) stop(now f64) ! {
 	if h.state != .recording {
 		return error('not recording')
 	}
-	// Join the segmenter before tearing down capture: the worker reads the
-	// capture buffer, so stopping first could let it snapshot a cleared take.
-	h.stop_segmenter()
-	samples := h.capture.stop()!
+	h.stop_segmenter_begin()
+	samples := h.capture.stop() or {
+		err_text := err.msg()
+		h.stop_segmenter_finish()
+		return error(err_text)
+	}
 	h.last_use = now
 	wav_write_f32(h.last_wav, samples, 16000) or {
 		hexv_log('could not save last recording: ${err}')
 	}
 	hexv_log('recording stopped: ${samples.len} samples (${f64(samples.len) / 16000.0:.2f} s) -> ${h.last_wav}')
+	// The worker may still be committing the segment that was in flight at
+	// capture stop; read seg_cursor and seg_texts only after that commit.
+	h.stop_segmenter_finish()
 	h.seg_mu.lock()
 	prefix := h.seg_texts.clone()
 	mut cursor := h.seg_cursor
