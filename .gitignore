@@ -4,18 +4,8 @@
 # Local-only benchmark policy/notes. Never commit benchmark output.
 /benchmarks.md
 
-# Local-only lean comparison workspace: only build sources are trackable.
-/lean comparison/*
-!/lean comparison/lean-toolchain
-!/lean comparison/lakefile.lean
-!/lean comparison/lake-manifest.json
-!/lean comparison/DotScope.lean
-!/lean comparison/Replay.lean
-!/lean comparison/Main.lean
-!/lean comparison/Verify.lean
-!/lean comparison/Tests.lean
-/lean comparison/.lake/
-/lean comparison/out/
+# Local-only lean comparison workspace
+/lean comparison/
 
 # Build output
 /v/bin/
@@ -39,9 +29,6 @@ dots.bin
 models/
 *.gguf
 *.dll
-
-# Subagent review artifacts (normally outside the repo under ~/.pi)
-subagent-artifacts/
 
 # Editor / OS junk
 .DS_Store
