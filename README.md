@@ -164,7 +164,9 @@ sits next to the exe. It does not copy the model or reimplement ASR.
 | `engine` | ignored. hex-v has one engine, the shim, so `engine=auto` selects nothing. |
 
 Models are read from `%APPDATA%\hex\models`: `phonon-2.5-en-Q8_0.gguf` — the
-only one hex-v will load — plus `silero-vad-v6.2-F32.gguf`.
+only one hex-v will load — plus `silero-vad-v6.2-F32.gguf`. Run
+`.\provision-models.ps1` (or `hexv models install`) once to verify or install
+both with the pinned sizes and hashes; `hexv models check` is verify-only.
 
 ## Latency
 
@@ -225,4 +227,5 @@ versus 8 has never been measured for hex-v, so no figure is claimed for it.
 .\v\bin\hexv.exe render v/out
 .\v\bin\hexv.exe probe      # real WM_TIMER spacing for SetTimer(42)
 .\v\bin\hexv.exe paint-probe
+.\v\bin\hexv.exe models check|install
 ```
