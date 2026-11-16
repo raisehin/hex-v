@@ -424,7 +424,12 @@ fn (mut h Host) start(now f64) ! {
 	h.state = .recording
 	power_eco(false)
 	if !h.asr.is_loaded() {
-		hexv_log('listening: model preload still in progress')
+		// The model is resident by default (idle release is opt-in), but a
+		// failed startup preload, an opt-in idle release, or a short restart
+		// can leave it cold. Warm it at key-down so speaking time overlaps the
+		// load instead of the release path paying model-wait.
+		hexv_log('listening: warming model and VAD at key-down')
+		spawn preload_worker(h.asr, h.cfg.model_path(), h.cfg.threads, h.cfg.vad_path())
 	}
 }
 
