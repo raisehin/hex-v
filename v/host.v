@@ -82,6 +82,9 @@ mut:
 	seg_closing  bool
 	seg_fail     int
 	seg_saw_speech bool
+	vad_window     []f32
+	vad_window_lo  int
+	vad_window_end int
 	last_use     f64
 	last_wav     string
 	busy         bool
@@ -243,10 +246,32 @@ fn quietest_frame_end(samples []f32, from int, to int) int {
 	return best + seg_frame_samples
 }
 
-// segment_poll runs entirely on the segment worker: VAD, then inference. The
-// paint thread only pumps the mic and draws. Only the suffix is copied, and
-// the VAD gets 1.024 s of left context so its splice point stays close to the
-// old whole-buffer answer.
+// vad_suffix keeps the 512-grid-snapped left context as one contiguous buffer
+// and appends only newly captured samples. The VAD ABI still receives the same
+// absolute 16 kHz suffix it did before; only the per-poll copy is removed.
+fn (mut h Host) vad_suffix(lo int) []f32 {
+	if h.vad_window.len == 0 || lo < h.vad_window_lo || lo > h.vad_window_end {
+		h.vad_window = h.capture.snapshot_16k_from(lo)
+		h.vad_window_lo = lo
+		h.vad_window_end = lo + h.vad_window.len
+		return h.vad_window
+	}
+	if lo > h.vad_window_lo {
+		drop := lo - h.vad_window_lo
+		h.vad_window = h.vad_window[drop..].clone()
+		h.vad_window_lo = lo
+	}
+	fresh := h.capture.snapshot_16k_from(h.vad_window_end)
+	if fresh.len > 0 {
+		h.vad_window << fresh
+		h.vad_window_end += fresh.len
+	}
+	return h.vad_window
+}
+
+// segment_poll runs entirely on the segment worker: VAD, then inference.
+// The paint thread only pumps the mic and draws. The VAD suffix is now kept
+// incrementally by vad_suffix, with the same 512-grid left context.
 fn (mut h Host) segment_poll() {
 	h.seg_mu.lock()
 	mut cursor := h.seg_cursor
@@ -265,7 +290,7 @@ fn (mut h Host) segment_poll() {
 	// The VAD consumes 512-sample frames; keeping its start on that grid makes
 	// a suffix call match the whole-buffer boundary instead of shifting it.
 	lo -= lo % 512
-	sfx := h.capture.snapshot_16k_from(lo)
+	sfx := h.vad_suffix(lo)
 	if sfx.len == 0 {
 		return
 	}
@@ -445,6 +470,9 @@ fn (mut h Host) start(now f64) ! {
 	h.seg_fail = 0
 	h.seg_saw_speech = false
 	h.seg_active = true
+	h.vad_window = []f32{}
+	h.vad_window_lo = 0
+	h.vad_window_end = 0
 	h.seg_mu.unlock()
 	// Clipboard snapshot now overlaps speaking; the modifier wait stays late.
 	spawn paste_prepare_worker(h.generation, h.paste_prep_ch)
