@@ -19,8 +19,11 @@ const seg_silence_ms = 300
 // segment at 88.5 s and the whole 31.6 s remainder was transcribed in one tail
 // call after the key came up (7,679 ms). Past this many unsegmented samples the
 // worker cuts anyway, which bounds release-to-text latency at one segment.
-const seg_force_cut_samples = 48000 // 3 s at 16 kHz
-const seg_force_search_samples = 19200 // 1.2 s window to look for the quietest cut
+// The cap is now 2 s at 16 kHz, with a proportional 0.8 s quietest-frame
+// search window. `seg_silence_ms` stays 300 ms; this only tightens the forced
+// cut for uninterrupted speech.
+const seg_force_cut_samples = 32000 // 2 s at 16 kHz
+const seg_force_search_samples = 12800 // 0.8 s window to look for the quietest cut
 const seg_frame_samples = 320 // 20 ms at 16 kHz
 
 enum HostState {
