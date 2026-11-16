@@ -488,6 +488,15 @@ fn (mut h Host) stop_segmenter() {
 	h.stop_segmenter_finish()
 }
 
+// wav_save_worker keeps the debug WAV without putting the disk write on the
+// release path. It owns a copy of the take so the tail can read samples while
+// the write runs in parallel.
+fn wav_save_worker(path string, samples []f32) {
+	wav_write_f32(path, samples, 16000) or {
+		hexv_log('could not save last recording: ${err}')
+	}
+}
+
 fn (mut h Host) stop(now f64) ! {
 	if h.state != .recording {
 		return error('not recording')
@@ -500,10 +509,8 @@ fn (mut h Host) stop(now f64) ! {
 	}
 	begin_release_boost()
 	h.last_use = now
-	wav_write_f32(h.last_wav, samples, 16000) or {
-		hexv_log('could not save last recording: ${err}')
-	}
-	hexv_log('recording stopped: ${samples.len} samples (${f64(samples.len) / 16000.0:.2f} s) -> ${h.last_wav}')
+	spawn wav_save_worker(h.last_wav, samples.clone())
+	hexv_log('recording stopped: ${samples.len} samples (${f64(samples.len) / 16000.0:.2f} s) -> ${h.last_wav} (wav write backgrounded)')
 	// The worker may still be committing the segment that was in flight at
 	// capture stop; read seg_cursor and seg_texts only after that commit.
 	h.stop_segmenter_finish()
