@@ -56,6 +56,7 @@ const wm_keydown = u32(0x100)
 const wm_quit = u32(0x12)
 const pm_remove = u32(1)
 const gwlp_userdata = i32(-21)
+const gwl_exstyle = i32(-20)
 const vk_escape = u64(0x1b)
 const vk_space = u64(0x20)
 const vk_control = u64(0x11)
@@ -255,9 +256,14 @@ fn (mut phrase DemoPhrase) tick(mut indicator Indicator, now f64, reduce bool) {
 
 // wnd_proc records a restart request in the window's user data and quits on
 // Esc: the paint loop owns the indicator, so the window procedure mutates
-// nothing else.
+// nothing else. The tray callback is the one exception, because it arrives on
+// this window's queue.
 fn wnd_proc(hwnd voidptr, msg u32, wparam u64, lparam i64) i64 {
+	if tray_handle_message(hwnd, msg, wparam, lparam) {
+		return 0
+	}
 	if msg == wm_close || msg == wm_destroy {
+		tray_remove(hwnd)
 		C.PostQuitMessage(0)
 		return 0
 	}
@@ -293,6 +299,7 @@ fn layered_surface_open(visible bool) !LayeredSurface {
 	mut wc := W32WndClass{
 		wnd_proc:   voidptr(wnd_proc)
 		instance:   instance
+		icon:       app_icon(instance, int(C.GetSystemMetrics(sm_cxicon)), int(C.GetSystemMetrics(sm_cyicon)))
 		cursor:     C.LoadCursorA(voidptr(0), cursor_arrow)
 		class_name: voidptr(class_name)
 	}
@@ -311,6 +318,7 @@ fn layered_surface_open(visible bool) !LayeredSurface {
 	if surface.hwnd == voidptr(0) {
 		return error('CreateWindowExA failed: ${C.GetLastError()}')
 	}
+	tray_set_window_icon(surface.hwnd)
 	surface.mem_dc = C.CreateCompatibleDC(voidptr(0))
 	if surface.mem_dc == voidptr(0) {
 		C.DestroyWindow(surface.hwnd)
@@ -495,6 +503,9 @@ pub fn run_window() {
 		eprintln('hexv: ${err}')
 		return
 	}
+	if !tray_add(surface.hwnd) {
+		hexv_log('tray: continuing without a notification-area icon')
+	}
 	C.timeBeginPeriod(1)
 	mut clock := paint_clock_new()
 	mut indicator := indicator_new(tuning_default())
@@ -588,6 +599,27 @@ pub fn run_window() {
 	}
 	host.shutdown()
 	C.timeEndPeriod(1)
+	surface.close()
+}
+
+// run_exstyle_probe opens the HUD window exactly as run_window does and prints
+// its extended style. That number, not a screenshot, says whether a taskbar
+// button can appear: WS_EX_TOOLWINDOW (0x80) set means no button and no Alt-Tab
+// entry, because Windows excludes tool windows from both.
+pub fn run_exstyle_probe() {
+	mut surface := layered_surface_open(false) or {
+		eprintln('hexv: ${err}')
+		return
+	}
+	ex := u64(C.GetWindowLongPtrA(surface.hwnd, gwl_exstyle))
+	println('hwnd=0x${u64(uint(surface.hwnd)):x} GWL_EXSTYLE=0x${ex:x}')
+	if ex & u64(ws_ex_toolwindow) != 0 {
+		println('  WS_EX_TOOLWINDOW set -> no taskbar button, no Alt-Tab entry')
+	} else {
+		println('  WS_EX_TOOLWINDOW clear -> a taskbar button can appear')
+	}
+	println('  WS_EX_NOACTIVATE=${ex & u64(ws_ex_noactivate) != 0} WS_EX_LAYERED=${ex & u64(ws_ex_layered) != 0} WS_EX_TRANSPARENT=${ex & u64(ws_ex_transparent) != 0}')
+	println('  tray icon resource 1: ${if tray_icon() != voidptr(0) { 'present' } else { 'MISSING' }}')
 	surface.close()
 }
 

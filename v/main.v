@@ -10,6 +10,7 @@ fn main() {
 		'replay' { run_replay(if os.args.len > 2 { os.args[2] } else { 'out' }) }
 		'render' { run_render(if os.args.len > 2 { os.args[2] } else { 'out' }) }
 		'probe' { run_probe() }
+		'exstyle' { run_exstyle_probe() }
 		'paint-probe' { run_paint_pacing() }
 		'transcribe' {
 			if os.args.len < 3 {

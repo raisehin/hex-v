@@ -24,6 +24,23 @@ if (-not $root) { $root = Split-Path -Parent $MyInvocation.MyCommand.Path }
 Push-Location $root
 
 try {
+    # A build that silently drops the icon still runs, so the failure would surface
+    # as a blank file icon and an empty tray days later. V embeds the resource
+    # itself on Windows (vlib/v/driver/windows_icon.v, RT_GROUP_ICON id 1); windres
+    # is only used for cross builds, so assert the artefact rather than a tool.
+    function Assert-EmbeddedIcon([string]$exe) {
+        $bytes = [IO.File]::ReadAllBytes($exe)
+        $pe = [BitConverter]::ToInt32($bytes, 0x3c)
+        $sections = [BitConverter]::ToUInt16($bytes, $pe + 6)
+        $optSize = [BitConverter]::ToUInt16($bytes, $pe + 20)
+        $table = $pe + 24 + $optSize
+        for ($i = 0; $i -lt $sections; $i++) {
+            $name = [Text.Encoding]::ASCII.GetString($bytes, $table + $i * 40, 8).TrimEnd([char]0)
+            if ($name -eq '.rsrc') { return }
+        }
+        throw "no .rsrc section in $exe - the icon was not embedded"
+    }
+
     function Resolve-V([string]$path) {
         if ([string]::IsNullOrWhiteSpace($path)) { return $null }
         if (Test-Path $path -PathType Leaf) { return (Resolve-Path $path).Path }
@@ -145,6 +162,8 @@ try {
     $src = Join-Path $root 'v'
     $outDir = Join-Path $src 'bin'
     $out = Join-Path $outDir 'hexv.exe'
+    $icon = Join-Path $src 'hex.ico'
+    if (-not (Test-Path $icon -PathType Leaf)) { throw "app icon missing: $icon" }
     New-Item -ItemType Directory -Force -Path $outDir | Out-Null
     Remove-Item -Force $out -ErrorAction SilentlyContinue
 
@@ -153,8 +172,9 @@ try {
     # clean builds produce the same bytes.
     $env:SOURCE_DATE_EPOCH = '0'
 
-    & $vExe -prod -cc gcc -cflags "-ffp-contract=off" -o $out $src
+    & $vExe -prod -cc gcc -cflags "-ffp-contract=off" -icon $icon -o $out $src
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    Assert-EmbeddedIcon $out
     Write-Host "built $out"
 } finally {
     Pop-Location
