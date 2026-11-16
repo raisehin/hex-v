@@ -42,6 +42,11 @@ mut:
 	generation int
 }
 
+struct PastePrepared {
+	generation int
+	prep       PastePrep
+}
+
 // PasteResult carries the outcome of the clipboard/paste leg back to the paint
 // thread, which polls for it instead of blocking on it. generation lets the
 // paint thread and the worker itself drop a paste that belongs to a take the
@@ -62,6 +67,7 @@ mut:
 	generation   int
 	ch           chan TranscribeResult
 	paste_ch     chan PasteResult
+	paste_prep_ch chan PastePrepared
 	seg_threads  []thread
 	seg_mu       sync.Mutex
 	seg_texts    []string
@@ -80,6 +86,7 @@ fn new_host(cfg HostConfig) &Host {
 		asr:      &AsrShim{}
 		ch:       chan TranscribeResult{cap: 4}
 		paste_ch: chan PasteResult{cap: 4}
+		paste_prep_ch: chan PastePrepared{cap: 2}
 		state:    .idle
 		last_wav: '${cfg.data_dir}\\hexv-last.wav'
 	}
@@ -391,6 +398,7 @@ fn (mut h Host) start(now f64) ! {
 		return error('model busy')
 	}
 	h.stop_segmenter()
+	h.paste_prep_ch = chan PastePrepared{cap: 2}
 	h.capture.start()!
 	h.seg_mu.lock()
 	// Bumped under seg_mu so take_generation() on a paste worker actually
@@ -479,14 +487,19 @@ fn (mut h Host) stop(now f64) ! {
 	gen := h.generation
 	spawn tail_worker(h.asr, h.cfg.model_path(), h.cfg.threads, h.cfg.language, tail,
 		prefix, gen, h.ch)
+	// Snapshot the old clipboard and wait for modifiers while the tail infers.
+	spawn paste_prepare_worker(gen, h.paste_prep_ch)
 }
 
-// start_paste runs the clipboard/paste leg on a worker. It blocks for up to
-// about a second (modifier wait, clipboard round trip, 500 ms restore delay),
-// and running it on the paint thread froze the HUD and made keys.poll miss a
-// quick Ctrl+Space entirely.
-fn (mut h Host) start_paste(text string) {
-	spawn paste_worker(mut h, text, h.generation, h.paste_ch)
+// start_paste runs the clipboard/paste leg on a worker. Snapshotting the old
+// clipboard and the modifier wait already overlap the tail; running the rest
+// on a worker keeps the paint loop polling keys.
+fn (mut h Host) start_paste(text string, generation int) {
+	spawn paste_worker(mut h, text, generation, h.paste_ch, h.paste_prep_ch)
+}
+
+fn paste_prepare_worker(generation int, ch chan PastePrepared) {
+	ch <- PastePrepared{generation: generation, prep: paste_prepare()}
 }
 
 // take_generation reads the current take id under the segmenter lock, which is
@@ -499,7 +512,7 @@ fn (mut h Host) take_generation() int {
 	return h.generation
 }
 
-fn paste_worker(mut h Host, text string, generation int, ch chan PasteResult) {
+fn paste_worker(mut h Host, text string, generation int, ch chan PasteResult, prep_ch chan PastePrepared) {
 	mut r := PasteResult{
 		text:       text
 		generation: generation
@@ -511,7 +524,21 @@ fn paste_worker(mut h Host, text string, generation int, ch chan PasteResult) {
 		ch <- r
 		return
 	}
-	paste_text(text) or { r.err = err.msg() }
+	mut prep := PastePrep{}
+	for {
+		mut candidate := PastePrepared{}
+		if prep_ch.try_pop(mut candidate) != .success {
+			break
+		}
+		if candidate.generation == generation {
+			prep = candidate.prep
+			break
+		}
+	}
+	if !prep.valid {
+		prep = paste_prepare()
+	}
+	paste_finish(text, paste_mode(), mut prep) or { r.err = err.msg() }
 	ch <- r
 }
 

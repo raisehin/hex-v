@@ -184,11 +184,10 @@ Release to text is therefore **about 0.55-0.60 s**: 535 ms of tail inference,
 then the clipboard write and `SendInput` chord (tens of ms, not logged). Two
 things that are easy to get wrong:
 
-- the `pasted` line is written *after* `paste_restore_delay_ms` (`paste.v:27`)
-  has slept 500 ms following the chord, so it is not the text-arrival time;
-  differencing it against `recording stopped` invents a delay nobody waits for;
-- `paste_wait_for_modifiers` (`paste.v:28`) can add up to 500 ms *before* the
-  chord, but only when Ctrl is still held once the tail finishes.
+- the `pasted` line is written when the chord is sent; the 500 ms
+  `paste_restore_delay_ms` (`paste.v:27`) then runs before clipboard restore;
+- the modifier wait is capped at 100 ms (`paste.v:28`) and overlaps the tail,
+  so a Ctrl still held at release no longer adds a separate 500 ms delay.
 
 Same build and WAV through the CLI: `inference 2085-2476 ms` for
 `samples=154529`, i.e. 216-256 ms per second of audio (per-second figures here
