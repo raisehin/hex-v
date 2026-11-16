@@ -172,7 +172,7 @@ try {
     # clean builds produce the same bytes.
     $env:SOURCE_DATE_EPOCH = '0'
 
-    & $vExe -prod -cc gcc -cflags "-ffp-contract=off" -icon $icon -o $out $src
+    & $vExe -prod -enable-globals -cc gcc -cflags "-ffp-contract=off" -icon $icon -o $out $src
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     Assert-EmbeddedIcon $out
     Write-Host "built $out"
