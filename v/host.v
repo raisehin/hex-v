@@ -427,6 +427,8 @@ fn (mut h Host) start(now f64) ! {
 	h.seg_saw_speech = false
 	h.seg_active = true
 	h.seg_mu.unlock()
+	// Clipboard snapshot now overlaps speaking; the modifier wait stays late.
+	spawn paste_prepare_worker(h.generation, h.paste_prep_ch)
 	h.seg_threads << spawn segment_worker(mut h)
 	h.state = .recording
 	power_eco(false)
@@ -547,8 +549,6 @@ fn (mut h Host) stop(now f64) ! {
 	gen := h.generation
 	spawn tail_worker(h.asr, h.cfg.model_path(), h.cfg.threads, h.cfg.language, tail,
 		prefix, gen, h.ch)
-	// Snapshot the old clipboard and wait for modifiers while the tail infers.
-	spawn paste_prepare_worker(gen, h.paste_prep_ch)
 }
 
 // start_paste runs the clipboard/paste leg on a worker. Snapshotting the old
@@ -559,7 +559,7 @@ fn (mut h Host) start_paste(text string, generation int) {
 }
 
 fn paste_prepare_worker(generation int, ch chan PastePrepared) {
-	ch <- PastePrepared{generation: generation, prep: paste_prepare()}
+	ch <- PastePrepared{generation: generation, prep: paste_snapshot()}
 }
 
 // take_generation reads the current take id under the segmenter lock, which is
@@ -596,8 +596,10 @@ fn paste_worker(mut h Host, text string, generation int, ch chan PasteResult, pr
 		}
 	}
 	if !prep.valid {
-		prep = paste_prepare()
+		prep = paste_snapshot()
 	}
+	// The snapshot was taken at key-down; modifiers are checked only now.
+	paste_wait_for_modifiers()
 	paste_finish(text, paste_mode(), mut prep) or { r.err = err.msg() }
 	ch <- r
 }
