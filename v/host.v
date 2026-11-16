@@ -445,7 +445,16 @@ fn (mut h Host) pump_level() f32 {
 		return -120.0
 	}
 	h.capture.pump()
-	return h.capture.rms_db()
+	db := h.capture.rms_db()
+	// Conservative speech evidence from the paint loop: set the bit only on a
+	// clearly audible frame. A false positive merely skips the whole-take
+	// vad_has_speech fallback; ASR still runs. A false negative keeps it.
+	if db > -50.0 {
+		h.seg_mu.lock()
+		h.seg_saw_speech = true
+		h.seg_mu.unlock()
+	}
+	return db
 }
 
 // segment_tick is gone: the segment worker owns the 500 ms cadence, so the
