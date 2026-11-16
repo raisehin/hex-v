@@ -617,7 +617,7 @@ pub fn run_window() {
 				// Off the paint thread: the paste leg can block for ~1 s, and
 				// blocking here froze the HUD and made keys.poll miss a quick
 				// Ctrl+Space tap entirely.
-				host.start_paste(result.text)
+				host.start_paste(result.text, result.generation)
 			}
 		} else if result.generation != 0 {
 			hexv_log('transcription discarded')
