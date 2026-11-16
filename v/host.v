@@ -368,6 +368,15 @@ fn tail_worker(asr &AsrShim, model_path string, threads int, language string,
 	trimmed, trim_ms := trim_trailing_silence(tail)
 	result.trim_ms = trim_ms
 	result.samples = trimmed.len
+	// Conservative silent-tail gate: only skip the model call when VAD is
+	// actually loaded, the tail is long enough to judge, and committed prefix
+	// text exists. Otherwise fall through to the normal transcribe path.
+	if trimmed.len >= seg_min_samples && prefix.len > 0 && asr.vad_ready() && !asr.vad_has_speech(trimmed) {
+		result.text = prefix.join(' ')
+		hexv_log('tail: skipped silent tail samples=${trimmed.len} prefix=${prefix.len}')
+		ch <- result
+		return
+	}
 	t0 := time.sys_mono_now()
 	result.load_ms = asr.ensure_model(model_path, threads) or {
 		result.err = err.msg()

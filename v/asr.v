@@ -431,6 +431,16 @@ fn (mut s AsrShim) is_loaded() bool {
 	return s.loaded
 }
 
+// vad_ready gates the conservative silent-tail shortcut: VAD absence must
+// never be read as "silence".
+fn (mut s AsrShim) vad_ready() bool {
+	s.mu.lock()
+	defer {
+		s.mu.unlock()
+	}
+	return s.vad_loaded && s.f_vad_has != 0
+}
+
 fn (mut s AsrShim) close_model() {
 	s.mu.lock()
 	defer {
