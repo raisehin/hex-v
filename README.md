@@ -200,7 +200,8 @@ encoder cost dominates a short slice.
 Shipped from the speed-up work, all in `v/host.v`: a segment already in flight
 at release commits instead of being dropped and re-transcribed by the tail; the
 clipboard/paste leg runs on a worker, so the paint loop keeps polling keys;
-`seg_poll_ms` 250; exact leading zeros are skipped before inference; and an
+`seg_poll_ms` 100, `seg_silence_ms` 300 and a 3 s forced-cut ceiling;
+exact leading zeros are skipped before inference; and an
 empty transcript over real audio is logged and surfaced as a failure rather
 than a silent success.
 

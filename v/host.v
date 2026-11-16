@@ -9,17 +9,17 @@ const min_recording_samples = 3200 // 0.2 s at 16 kHz
 const seg_min_samples = 16000
 const seg_ctx_samples = 3200
 const vad_ctx_samples = 16384
-// 500 ms left up to a full interval of uncheckpointed audio behind every
-// release; the VAD call itself costs 30-50 ms, so the poll can run faster.
-const seg_poll_ms = 250
-const seg_silence_ms = 500
+// A short poll and silence window leave less uncheckpointed audio behind at
+// release; the VAD call itself costs 30-50 ms, so do not shrink below 100 ms.
+const seg_poll_ms = 100
+const seg_silence_ms = 300
 
 // A segment used to close only on `seg_silence_ms` of silence, so continuous
 // speech never checkpointed at all: in the log a 120 s take closed its last
 // segment at 88.5 s and the whole 31.6 s remainder was transcribed in one tail
 // call after the key came up (7,679 ms). Past this many unsegmented samples the
 // worker cuts anyway, which bounds release-to-text latency at one segment.
-const seg_force_cut_samples = 96000 // 6 s at 16 kHz
+const seg_force_cut_samples = 48000 // 3 s at 16 kHz
 const seg_force_search_samples = 19200 // 1.2 s window to look for the quietest cut
 const seg_frame_samples = 320 // 20 ms at 16 kHz
 
