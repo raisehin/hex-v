@@ -242,9 +242,9 @@ struct PastePrep {
 	old_seq      u32
 }
 
-// paste_prepare snapshots the previous clipboard while the tail infers.
-fn paste_prepare() PastePrep {
-	paste_wait_for_modifiers()
+// paste_snapshot only reads the current clipboard. The modifier wait is a
+// separate late step so the snapshot can be taken at key-down.
+fn paste_snapshot() PastePrep {
 	mut cb := clipboard.new()
 	defer {
 		cb.destroy()
@@ -257,6 +257,11 @@ fn paste_prepare() PastePrep {
 		non_text:     old_text == '' && C.CountClipboardFormats() > 0
 		old_seq:      C.GetClipboardSequenceNumber()
 	}
+}
+
+fn paste_prepare() PastePrep {
+	paste_wait_for_modifiers()
+	return paste_snapshot()
 }
 
 // paste_finish only writes the clipboard and sends the chord; the 500 ms
@@ -281,7 +286,7 @@ fn paste_finish(text string, mode PasteMode, mut prep PastePrep) ! {
 	// snapshot in that case instead of overwriting their newer clipboard.
 	if prep.valid && C.GetClipboardSequenceNumber() != prep.old_seq {
 		hexv_log('paste: clipboard changed during tail, refreshing snapshot')
-		prep = paste_prepare()
+		prep = paste_snapshot()
 	}
 	mut cb := clipboard.new()
 	defer {
