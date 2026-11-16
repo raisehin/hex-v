@@ -99,6 +99,21 @@ fn new_host(cfg HostConfig) &Host {
 	}
 }
 
+// frame_energy_prefix lets trim and quietest-frame scans read the sum of any
+// 320-sample window in O(1). The windows keep their exact start offsets, so
+// the 20 ms grid and the 512-sample VAD grid are unchanged.
+fn frame_energy_prefix(samples []f32) []f64 {
+	mut prefix := []f64{len: samples.len + 1}
+	for i in 0 .. samples.len {
+		prefix[i + 1] = prefix[i] + f64(samples[i]) * f64(samples[i])
+	}
+	return prefix
+}
+
+fn frame_energy_sum(prefix []f64, from int, to int) f64 {
+	return prefix[to] - prefix[from]
+}
+
 // trim_trailing_silence is the same algorithm and constants as the reference
 // transcriber: 20 ms frames, -30 dB relative floor, five-frame speech runs,
 // 250 ms tail pad, and no cut shorter than 100 ms.
@@ -111,14 +126,11 @@ fn trim_trailing_silence(samples []f32) ([]f32, int) {
 	mut peak_ms := f32(0)
 	frames := (samples.len + frame - 1) / frame
 	mut energy := []f32{len: frames}
+	prefix := frame_energy_prefix(samples)
 	for i in 0 .. frames {
 		off := i * frame
 		end := if off + frame < samples.len { off + frame } else { samples.len }
-		mut acc := f32(0)
-		for s in samples[off..end] {
-			acc += s * s
-		}
-		energy[i] = acc / f32(frame)
+		energy[i] = f32(frame_energy_sum(prefix, off, end) / f64(frame))
 		if energy[i] > peak_ms {
 			peak_ms = energy[i]
 		}
@@ -217,13 +229,11 @@ fn quietest_frame_end(samples []f32, from int, to int) int {
 		return to
 	}
 	mut best := from
-	mut best_energy := f32(-1.0)
+	mut best_energy := f64(-1.0)
 	mut i := from
+	prefix := frame_energy_prefix(samples)
 	for i + seg_frame_samples <= to {
-		mut acc := f32(0.0)
-		for s in samples[i..i + seg_frame_samples] {
-			acc += s * s
-		}
+		acc := frame_energy_sum(prefix, i, i + seg_frame_samples)
 		if best_energy < 0.0 || acc < best_energy {
 			best_energy = acc
 			best = i
