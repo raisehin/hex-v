@@ -43,7 +43,6 @@ const carrier_rest = f32(0.14)
 const ring_birth = f32(0.15)
 const beam_fade = f32(0.14)
 
-const max_columns = 96
 const max_rows = 15
 const max_dots = 1024
 const plate_height = f32(26.0)

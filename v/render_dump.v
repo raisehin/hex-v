@@ -160,7 +160,7 @@ fn replay_frames() []FrameInput {
 		now := f64(t)
 		for ev_i < events.len && events[ev_i].at <= now {
 			match events[ev_i].kind {
-				'started' { m.on_started(now, false) }
+				'started' { m.on_started(now) }
 				'submitted' { m.on_submitted(now) }
 				'processing' { m.show_pipeline(now) }
 				'completed' { m.on_completed(now) }

@@ -82,7 +82,7 @@ fn (mut s SharedTake) slice(from int, len int) []f32 {
 	if len <= 0 || from >= s.data.len {
 		return []f32{}
 	}
-	end := from + len
+	mut end := from + len
 	if end > s.data.len {
 		end = s.data.len
 	}
