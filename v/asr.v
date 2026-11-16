@@ -56,6 +56,7 @@ fn C.SetProcessInformation(process voidptr, class i32, info voidptr, size u32) i
 struct AsrShim {
 mut:
 	mu             sync.Mutex
+	vad_mu         sync.Mutex
 	boost_mu       sync.Mutex
 	boost_active   bool
 	lib            voidptr
@@ -377,20 +378,30 @@ fn (mut s AsrShim) transcribe(samples []f32, language string) !(string, f64) {
 }
 
 fn (mut s AsrShim) ensure_vad(path string) ! {
+	// Model/shim state uses mu; VAD state and VAD native calls use vad_mu so
+	// a long transcribe cannot block VAD polling.
 	s.mu.lock()
+	if s.lib == 0 {
+		s.load_shim_locked(resolve_shim_path()) or {
+			e := err
+			s.mu.unlock()
+			return e
+		}
+	}
+	f_init := s.f_vad_init
+	s.mu.unlock()
+
+	s.vad_mu.lock()
 	defer {
-		s.mu.unlock()
+		s.vad_mu.unlock()
 	}
 	if s.vad_loaded {
 		return
 	}
-	if s.lib == 0 {
-		s.load_shim_locked(resolve_shim_path())!
-	}
-	if s.f_vad_init == 0 || !os.exists(path) {
+	if f_init == 0 || !os.exists(path) {
 		return error('VAD unavailable')
 	}
-	rc := HexVadInit(s.f_vad_init)(path.str)
+	rc := HexVadInit(f_init)(path.str)
 	if rc != 0 {
 		return error('vad load failed (${rc})')
 	}
@@ -400,9 +411,9 @@ fn (mut s AsrShim) ensure_vad(path string) ! {
 }
 
 fn (mut s AsrShim) vad_has_speech(samples []f32) bool {
-	s.mu.lock()
+	s.vad_mu.lock()
 	defer {
-		s.mu.unlock()
+		s.vad_mu.unlock()
 	}
 	if !s.vad_loaded || s.f_vad_has == 0 || samples.len == 0 {
 		return true
@@ -413,9 +424,9 @@ fn (mut s AsrShim) vad_has_speech(samples []f32) bool {
 // vad_speech_end returns the end sample of the last closed speech segment, or
 // -1 while none is closed yet.
 fn (mut s AsrShim) vad_speech_end(samples []f32, min_silence_ms int) i64 {
-	s.mu.lock()
+	s.vad_mu.lock()
 	defer {
-		s.mu.unlock()
+		s.vad_mu.unlock()
 	}
 	if !s.vad_loaded || s.f_vad_end == 0 || samples.len == 0 {
 		return -1
@@ -434,9 +445,9 @@ fn (mut s AsrShim) is_loaded() bool {
 // vad_ready gates the conservative silent-tail shortcut: VAD absence must
 // never be read as "silence".
 fn (mut s AsrShim) vad_ready() bool {
-	s.mu.lock()
+	s.vad_mu.lock()
 	defer {
-		s.mu.unlock()
+		s.vad_mu.unlock()
 	}
 	return s.vad_loaded && s.f_vad_has != 0
 }
@@ -450,9 +461,14 @@ fn (mut s AsrShim) close_model() {
 }
 
 fn (mut s AsrShim) close_all() {
+	// Consistent mu -> vad_mu order with ensure_vad avoids lock inversion.
 	s.mu.lock()
 	defer {
 		s.mu.unlock()
+	}
+	s.vad_mu.lock()
+	defer {
+		s.vad_mu.unlock()
 	}
 	s.close_model_locked()
 	if s.vad_loaded && s.lib != 0 && s.f_vad_free != 0 {
