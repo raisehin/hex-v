@@ -64,6 +64,42 @@ mut:
 	generation int
 }
 
+// SharedTake owns one immutable captured take. WAV and tail workers each hold
+// a reference and release it when done, so key-up no longer clones the buffer
+// twice. Both consumers are read-only.
+struct SharedTake {
+mut:
+	data []f32
+	refs int
+	mu   sync.Mutex
+}
+
+fn new_shared_take(data []f32) &SharedTake {
+	return &SharedTake{data: data, refs: 2}
+}
+
+fn (mut s SharedTake) slice(from int, len int) []f32 {
+	if len <= 0 || from >= s.data.len {
+		return []f32{}
+	}
+	end := from + len
+	if end > s.data.len {
+		end = s.data.len
+	}
+	return s.data[from..end]
+}
+
+fn (mut s SharedTake) release() {
+	s.mu.lock()
+	defer {
+		s.mu.unlock()
+	}
+	s.refs--
+	if s.refs <= 0 {
+		s.data = []f32{}
+	}
+}
+
 struct Host {
 mut:
 	cfg          HostConfig
@@ -393,8 +429,12 @@ fn (mut h Host) segment_poll() {
 }
 
 fn tail_worker(asr &AsrShim, model_path string, threads int, language string,
-	tail []f32, prefix []string, generation int, ch chan TranscribeResult) {
+	take &SharedTake, tail_from int, tail_len int, prefix []string, generation int, ch chan TranscribeResult) {
+	defer {
+		take.release()
+	}
 	mut result := TranscribeResult{generation: generation}
+	tail := take.slice(tail_from, tail_len)
 	if tail.len == 0 {
 		result.text = prefix.join(' ')
 		ch <- result
@@ -536,10 +576,13 @@ fn (mut h Host) stop_segmenter() {
 }
 
 // wav_save_worker keeps the debug WAV without putting the disk write on the
-// release path. It owns a copy of the take so the tail can read samples while
-// the write runs in parallel.
-fn wav_save_worker(path string, samples []f32) {
-	wav_write_f32(path, samples, 16000) or {
+// release path. Its SharedTake reference keeps the immutable take alive while
+// the tail worker reads the same buffer in parallel.
+fn wav_save_worker(take &SharedTake, path string) {
+	defer {
+		take.release()
+	}
+	wav_write_f32(path, take.data, 16000) or {
 		hexv_log('could not save last recording: ${err}')
 	}
 }
@@ -556,7 +599,8 @@ fn (mut h Host) stop(now f64) ! {
 	}
 	h.asr.begin_release_boost()
 	h.last_use = now
-	spawn wav_save_worker(h.last_wav, samples.clone())
+	shared := new_shared_take(samples)
+	spawn wav_save_worker(shared, h.last_wav)
 	hexv_log('recording stopped: ${samples.len} samples (${f64(samples.len) / 16000.0:.2f} s) -> ${h.last_wav} (wav write backgrounded)')
 	// The worker may still be committing the segment that was in flight at
 	// capture stop; read seg_cursor and seg_texts only after that commit.
@@ -571,6 +615,7 @@ fn (mut h Host) stop(now f64) ! {
 	if samples.len < min_recording_samples {
 		h.state = .idle
 		h.asr.end_release_boost()
+		shared.release()
 		return error('recording too short (${samples.len} samples)')
 	}
 	// A closed VAD segment is proof that speech was seen; only an unknown or
@@ -581,6 +626,7 @@ fn (mut h Host) stop(now f64) ! {
 		if vad_ok && !h.asr.vad_has_speech(samples) {
 			h.state = .idle
 			h.asr.end_release_boost()
+			shared.release()
 			return error('no speech detected')
 		}
 	}
@@ -590,12 +636,13 @@ fn (mut h Host) stop(now f64) ! {
 			cursor = z
 		}
 	}
-	tail := if cursor < samples.len { samples[cursor..].clone() } else { []f32{} }
+	tail_from := cursor
+	tail_len := if cursor < samples.len { samples.len - cursor } else { 0 }
 	h.state = .processing
 	h.busy = true
 	gen := h.generation
-	spawn tail_worker(h.asr, h.cfg.model_path(), h.cfg.threads, h.cfg.language, tail,
-		prefix, gen, h.ch)
+	spawn tail_worker(h.asr, h.cfg.model_path(), h.cfg.threads, h.cfg.language,
+		shared, tail_from, tail_len, prefix, gen, h.ch)
 }
 
 // start_paste runs the clipboard/paste leg on a worker. Snapshotting the old
