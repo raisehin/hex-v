@@ -227,6 +227,12 @@ fn (mut h Host) segment_poll() {
 	mut cursor := h.seg_cursor
 	h.seg_mu.unlock()
 
+	// Do not snapshot or VAD while the model is still loading. The cursor is
+	// deliberately left untouched, so this audio remains for the tail.
+	if !h.asr.is_loaded() {
+		return
+	}
+
 	mut lo := cursor - vad_ctx_samples
 	if lo < 0 {
 		lo = 0
@@ -301,12 +307,6 @@ fn (mut h Host) segment_poll() {
 	if rel_end <= slice_start || rel_end > sfx.len {
 		return
 	}
-	// If the session is not open yet, leave this audio for the tail instead of
-	// spinning on the same span.
-	if !h.asr.is_loaded() {
-		return
-	}
-
 	slice := sfx[slice_start..rel_end]
 	trimmed, trim_ms := trim_trailing_silence(slice)
 	t_infer := time.sys_mono_now()
