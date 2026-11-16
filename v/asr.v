@@ -56,6 +56,8 @@ fn C.SetProcessInformation(process voidptr, class i32, info voidptr, size u32) i
 struct AsrShim {
 mut:
 	mu             sync.Mutex
+	boost_mu       sync.Mutex
+	boost_active   bool
 	lib            voidptr
 	f_init         voidptr
 	f_transcribe   voidptr
@@ -301,22 +303,65 @@ fn (mut s AsrShim) ensure_model(path string, threads int) !f64 {
 	return s.ensure_model_locked(path, threads)
 }
 
+fn (mut s AsrShim) release_boost_active() bool {
+	s.boost_mu.lock()
+	defer {
+		s.boost_mu.unlock()
+	}
+	return s.boost_active
+}
+
+fn (mut s AsrShim) begin_release_boost() {
+	s.boost_mu.lock()
+	if s.boost_active {
+		s.boost_mu.unlock()
+		return
+	}
+	s.boost_active = true
+	s.boost_mu.unlock()
+	set_transcribe_priority(true)
+	power_eco(false)
+}
+
+fn (mut s AsrShim) end_release_boost() {
+	s.boost_mu.lock()
+	if !s.boost_active {
+		s.boost_mu.unlock()
+		return
+	}
+	s.boost_active = false
+	s.boost_mu.unlock()
+	set_transcribe_priority(false)
+	power_eco(true)
+}
+
 fn (mut s AsrShim) transcribe(samples []f32, language string) !(string, f64) {
 	s.mu.lock()
 	defer {
 		s.mu.unlock()
 	}
+	managed_boost := s.release_boost_active()
+	if !managed_boost {
+		set_transcribe_priority(true)
+	}
 	if !s.loaded {
+		if !managed_boost {
+			set_transcribe_priority(false)
+		}
 		return error('model is not loaded')
 	}
 	if samples.len == 0 {
+		if !managed_boost {
+			set_transcribe_priority(false)
+		}
 		return error('no samples')
 	}
 	tr := HexTranscribe(s.f_transcribe)
 	t0 := time.sys_mono_now()
-	set_transcribe_priority(true)
 	res := tr(samples.data, i32(samples.len), language.str)
-	set_transcribe_priority(false)
+	if !managed_boost {
+		set_transcribe_priority(false)
+	}
 	elapsed := f64(time.sys_mono_now() - t0) / 1_000_000.0
 	if res == unsafe { nil } {
 		detail := s.last_error_text()

@@ -406,20 +406,6 @@ fn tail_worker(asr &AsrShim, model_path string, threads int, language string,
 	ch <- result
 }
 
-// begin_release_boost / end_release_boost bracket key-up through the final
-// paste. transcribe() still toggles priority for standalone callers, so the
-// boost is re-applied after each call and after an in-flight segment worker
-// joins.
-fn begin_release_boost() {
-	set_transcribe_priority(true)
-	power_eco(false)
-}
-
-fn end_release_boost() {
-	set_transcribe_priority(false)
-	power_eco(true)
-}
-
 fn (mut h Host) start(now f64) ! {
 	h.last_use = now
 	if h.state == .recording {
@@ -510,16 +496,15 @@ fn (mut h Host) stop(now f64) ! {
 		h.stop_segmenter_finish()
 		return error(err_text)
 	}
-	begin_release_boost()
+	h.asr.begin_release_boost()
 	h.last_use = now
 	spawn wav_save_worker(h.last_wav, samples.clone())
 	hexv_log('recording stopped: ${samples.len} samples (${f64(samples.len) / 16000.0:.2f} s) -> ${h.last_wav} (wav write backgrounded)')
 	// The worker may still be committing the segment that was in flight at
 	// capture stop; read seg_cursor and seg_texts only after that commit.
 	h.stop_segmenter_finish()
-	// An in-flight segment transcribe restores normal priority when it returns;
-	// re-apply the boost before the tail starts.
-	begin_release_boost()
+	// Idempotent: a second begin is a no-op while the host boost is active.
+	h.asr.begin_release_boost()
 	h.seg_mu.lock()
 	prefix := h.seg_texts.clone()
 	mut cursor := h.seg_cursor
@@ -527,7 +512,7 @@ fn (mut h Host) stop(now f64) ! {
 	h.seg_mu.unlock()
 	if samples.len < min_recording_samples {
 		h.state = .idle
-		end_release_boost()
+		h.asr.end_release_boost()
 		return error('recording too short (${samples.len} samples)')
 	}
 	// A closed VAD segment is proof that speech was seen; only an unknown or
@@ -537,7 +522,7 @@ fn (mut h Host) stop(now f64) ! {
 		h.asr.ensure_vad(h.cfg.vad_path()) or { vad_ok = false }
 		if vad_ok && !h.asr.vad_has_speech(samples) {
 			h.state = .idle
-			end_release_boost()
+			h.asr.end_release_boost()
 			return error('no speech detected')
 		}
 	}
@@ -619,7 +604,7 @@ fn (mut h Host) poll(now f64) (TranscribeResult, bool) {
 	h.last_use = now
 	accepted := result.generation == h.generation && h.state != .cancelling
 	h.state = .idle
-	end_release_boost()
+	h.asr.end_release_boost()
 	if !accepted {
 		hexv_log('discarded cancelled transcription')
 	}
@@ -669,7 +654,7 @@ fn (mut h Host) idle_check(now f64) {
 	limit := idle_model_seconds()
 	if limit > 0.0 && h.asr.is_loaded() && now - h.last_use >= limit {
 		h.asr.close_model()
-		end_release_boost()
+		h.asr.end_release_boost()
 	}
 }
 
@@ -681,7 +666,7 @@ fn (mut h Host) shutdown() {
 	if !h.busy {
 		h.asr.close_all()
 	}
-	end_release_boost()
+	h.asr.end_release_boost()
 }
 
 // --- CLI ------------------------------------------------------------------
