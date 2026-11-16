@@ -11,6 +11,7 @@ fn main() {
 		'render' { run_render(if os.args.len > 2 { os.args[2] } else { 'out' }) }
 		'probe' { run_probe() }
 		'exstyle' { run_exstyle_probe() }
+		'tray-probe' { run_tray_probe() }
 		'paint-probe' { run_paint_pacing() }
 		'transcribe' {
 			if os.args.len < 3 {
@@ -38,7 +39,7 @@ fn main() {
 			run_paste_cli(os.args[2])
 		}
 		else {
-			println('usage: hexv [run|replay [dir]|render [dir]|probe|paint-probe|transcribe <wav>|record <sec> <wav>|paste-file <wav>]')
+			println('usage: hexv [run|replay [dir]|render [dir]|probe|paint-probe|tray-probe|transcribe <wav>|record <sec> <wav>|paste-file <wav>]')
 		}
 	}
 }

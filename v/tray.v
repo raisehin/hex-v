@@ -43,6 +43,7 @@ const icon_big = u64(1)
 const tpm_rightbutton = u32(0x2)
 const tpm_returncmd = u32(0x100)
 const tray_tip_cells = 128
+const taskbar_created = 'TaskbarCreated'
 
 // NOTIFYICONDATAW, Vista layout: 976 bytes on x64. cbSize is derived from the
 // struct, so a layout mistake surfaces as a refused NIM_ADD (logged) instead of
@@ -76,6 +77,7 @@ fn C.GetCursorPos(point &W32Point) bool
 fn C.SetForegroundWindow(wnd voidptr) bool
 fn C.PostMessageW(wnd voidptr, message u32, wparam u64, lparam u64) bool
 fn C.SendMessageW(wnd voidptr, message u32, wparam u64, lparam u64) i64
+fn C.RegisterWindowMessageA(name voidptr) u32
 
 // app_icon returns an HICON from resource id 1 — the RT_GROUP_ICON that the
 // `-icon` compile flag embeds. 0 means the exe really has no icon resource.
@@ -124,22 +126,61 @@ fn tray_add(hwnd voidptr) bool {
 		hexv_log('tray: Shell_NotifyIconW(NIM_ADD) failed (cbSize=${sizeof(NotifyIconData)})')
 		return false
 	}
+	flags := C.GetWindowLongPtrA(hwnd, gwlp_userdata)
+	C.SetWindowLongPtrA(hwnd, gwlp_userdata, flags | ui_tray_added_bit)
 	hexv_log('tray: icon added (cbSize=${sizeof(NotifyIconData)})')
 	return true
 }
 
-fn tray_remove(hwnd voidptr) {
+// tray_remove is the only place NIM_DELETE is called, so every exit path logs
+// the same removal line and a refused delete is not silent.
+fn tray_remove(hwnd voidptr) bool {
 	mut nid := NotifyIconData{
 		cb_size: u32(sizeof(NotifyIconData))
 		hwnd:    hwnd
 		uid:     tray_uid
 	}
-	C.Shell_NotifyIconW(nim_delete, &nid)
+	if C.Shell_NotifyIconW(nim_delete, &nid) {
+		hexv_log('tray: icon removed')
+		return true
+	}
+	hexv_log('tray: icon remove failed (NIM_DELETE returned false)')
+	return false
+}
+
+// tray_remove_once removes the icon at most once per window. The added bit
+// lives in GWLP_USERDATA next to the restart flag, so a cleanup that runs after
+// WM_ENDSESSION (or after the run loop) does not log a second removal.
+fn tray_remove_once(hwnd voidptr) bool {
+	flags := C.GetWindowLongPtrA(hwnd, gwlp_userdata)
+	if flags & ui_tray_added_bit == 0 {
+		return false
+	}
+	if tray_remove(hwnd) {
+		C.SetWindowLongPtrA(hwnd, gwlp_userdata, flags & ~ui_tray_added_bit)
+		return true
+	}
+	return false
+}
+
+// tray_dispatch is the single tray-command path: TrackPopupMenu returns the id
+// under TPM_RETURNCMD (Windows does not post WM_COMMAND in that mode), and a
+// posted WM_COMMAND carries the same id, so both call this.
+fn tray_dispatch(_hwnd voidptr, id u32) bool {
+	if id == tray_menu_quit {
+		hexv_log('tray: menu command ${id} (quit hexv)')
+		hexv_log('tray: quit requested')
+		C.PostQuitMessage(0)
+		return true
+	}
+	hexv_log('tray: unknown menu command ${id}')
+	return false
 }
 
 // tray_menu shows the context menu. SetForegroundWindow before TrackPopupMenu and
 // a posted WM_NULL after it is the documented workaround for a menu that would
-// otherwise stay up after the click that dismissed it.
+// otherwise stay up after the click that dismissed it. TPM_RETURNCMD makes the
+// selected id the return value instead of a posted WM_COMMAND.
 fn tray_menu(hwnd voidptr) {
 	menu := C.CreatePopupMenu()
 	if menu == voidptr(0) {
@@ -149,13 +190,18 @@ fn tray_menu(hwnd voidptr) {
 	mut pt := W32Point{}
 	C.GetCursorPos(&pt)
 	C.SetForegroundWindow(hwnd)
-	C.TrackPopupMenu(menu, tpm_rightbutton | tpm_returncmd, pt.x, pt.y, 0, hwnd, voidptr(0))
+	id := u32(C.TrackPopupMenu(menu, tpm_rightbutton | tpm_returncmd, pt.x, pt.y, 0, hwnd,
+		voidptr(0)))
 	C.PostMessageW(hwnd, wm_null, 0, 0)
 	C.DestroyMenu(menu)
+	if id != 0 {
+		tray_dispatch(hwnd, id)
+	}
 }
 
-// tray_handle_message consumes the notification-area callback and the menu
-// command. Returns true when the message belonged to the tray.
+// tray_handle_message consumes the notification-area callback, the posted menu
+// command, and Explorer's TaskbarCreated broadcast. Returns true when the
+// message belonged to the tray.
 fn tray_handle_message(hwnd voidptr, msg u32, wparam u64, lparam i64) bool {
 	if msg == tray_message {
 		if lparam == i64(wm_contextmenu) || lparam == i64(wm_rbuttonup)
@@ -164,8 +210,12 @@ fn tray_handle_message(hwnd voidptr, msg u32, wparam u64, lparam i64) bool {
 		}
 		return true
 	}
-	if msg == wm_command && wparam == u64(tray_menu_quit) {
-		C.PostQuitMessage(0)
+	if msg == wm_command {
+		return tray_dispatch(hwnd, u32(wparam))
+	}
+	if msg == C.RegisterWindowMessageA(voidptr(taskbar_created.str)) {
+		hexv_log('tray: TaskbarCreated received, re-adding icon')
+		tray_add(hwnd)
 		return true
 	}
 	return false

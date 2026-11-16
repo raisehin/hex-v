@@ -52,11 +52,18 @@ const bi_rgb = u32(0)
 const dib_rgb_colors = u32(0)
 const wm_destroy = u32(2)
 const wm_close = u32(0x10)
+const wm_queryendsession = u32(0x11)
+const wm_endsession = u32(0x16)
 const wm_keydown = u32(0x100)
 const wm_quit = u32(0x12)
 const pm_remove = u32(1)
 const gwlp_userdata = i32(-21)
 const gwl_exstyle = i32(-20)
+// GWLP_USERDATA carries two independent flags: a restart request from Space
+// and whether the tray icon is currently added. They must not overwrite each
+// other, so both live in the same word.
+const ui_restart_bit = i64(1)
+const ui_tray_added_bit = i64(2)
 const vk_escape = u64(0x1b)
 const vk_space = u64(0x20)
 const vk_control = u64(0x11)
@@ -254,25 +261,40 @@ fn (mut phrase DemoPhrase) tick(mut indicator Indicator, now f64, reduce bool) {
 
 // --- window ---------------------------------------------------------------
 
-// wnd_proc records a restart request in the window's user data and quits on
-// Esc: the paint loop owns the indicator, so the window procedure mutates
-// nothing else. The tray callback is the one exception, because it arrives on
-// this window's queue.
+// wnd_proc records a restart request in the window's user data. Cancellation is
+// left to KeyPoll, which knows the host state: an unconditional Esc quit here
+// would contradict README's "Esc does nothing when idle" and bypass the polled
+// path that the WS_EX_NOACTIVATE window usually has to rely on anyway. The tray
+// callback, session-end messages and window close arrive on this queue.
 fn wnd_proc(hwnd voidptr, msg u32, wparam u64, lparam i64) i64 {
 	if tray_handle_message(hwnd, msg, wparam, lparam) {
 		return 0
 	}
 	if msg == wm_close || msg == wm_destroy {
-		tray_remove(hwnd)
+		hexv_log('window: close requested')
+		tray_remove_once(hwnd)
 		C.PostQuitMessage(0)
+		return 0
+	}
+	if msg == wm_queryendsession {
+		// TRUE allows the logoff/shutdown; WM_ENDSESSION follows if it proceeds.
+		return 1
+	}
+	if msg == wm_endsession {
+		if wparam != 0 {
+			hexv_log('window: WM_ENDSESSION, ending')
+			tray_remove_once(hwnd)
+			C.PostQuitMessage(0)
+		}
 		return 0
 	}
 	if msg == wm_keydown {
 		if wparam == vk_escape {
-			C.PostQuitMessage(0)
+			return 0
 		}
 		if wparam == vk_space {
-			C.SetWindowLongPtrA(hwnd, gwlp_userdata, i64(1))
+			flags := C.GetWindowLongPtrA(hwnd, gwlp_userdata)
+			C.SetWindowLongPtrA(hwnd, gwlp_userdata, flags | ui_restart_bit)
 		}
 		return 0
 	}
@@ -410,11 +432,31 @@ fn (mut surface LayeredSurface) pump(mut msg W32Msg) bool {
 }
 
 fn (mut surface LayeredSurface) take_restart_request() bool {
-	if C.GetWindowLongPtrA(surface.hwnd, gwlp_userdata) == 0 {
+	flags := C.GetWindowLongPtrA(surface.hwnd, gwlp_userdata)
+	if flags & ui_restart_bit == 0 {
 		return false
 	}
-	C.SetWindowLongPtrA(surface.hwnd, gwlp_userdata, i64(0))
+	C.SetWindowLongPtrA(surface.hwnd, gwlp_userdata, flags & ~ui_restart_bit)
 	return true
+}
+
+// quit_save_take keeps the audio from a take that is still recording when the
+// user quits. It saves exactly what Host.stop() saves, but deliberately does
+// not start the tail transcription: quitting must not launch inference.
+fn quit_save_take(mut host Host) {
+	host.stop_segmenter()
+	samples := host.capture.stop() or {
+		hexv_log('quit: capture stop failed: ${err}')
+		return
+	}
+	wav_write_f32(host.last_wav, samples, 16000) or {
+		hexv_log('quit: could not save last recording: ${err}')
+	}
+	hexv_log('quit: saved ${samples.len} samples (${f64(samples.len) / 16000.0:.2f} s) -> ${host.last_wav}')
+	host.seg_mu.lock()
+	host.seg_active = false
+	host.seg_mu.unlock()
+	host.state = .idle
 }
 
 // The window is WS_EX_NOACTIVATE, so it may never receive WM_KEYDOWN; poll the
@@ -522,6 +564,7 @@ pub fn run_window() {
 		now := clock.seconds()
 		press := keys.poll()
 		if press.quit {
+			hexv_log('quit: requested (Ctrl+Alt+Q)')
 			break
 		}
 		if press.escape && (host.state != .idle || host.busy) {
@@ -597,8 +640,13 @@ pub fn run_window() {
 		next_paint = paint_deadline(next_paint, clock.seconds())
 		pace(next_paint, &clock)
 	}
+	hexv_log('quit: leaving the message loop')
+	if host.state == .recording {
+		quit_save_take(mut host)
+	}
 	host.shutdown()
 	C.timeEndPeriod(1)
+	tray_remove_once(surface.hwnd)
 	surface.close()
 }
 
