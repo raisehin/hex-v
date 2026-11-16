@@ -139,6 +139,7 @@ fn trim_trailing_silence(samples []f32) ([]f32, int) {
 fn preload_worker(asr &AsrShim, model_path string, threads int, vad_path string) {
 	asr.ensure_vad(vad_path) or { hexv_log('preload: ${err}') }
 	asr.ensure_model(model_path, threads) or { hexv_log('preload: ${err}') }
+	hexv_log('startup: model preload complete')
 }
 
 // segment_worker polls on a deadline rather than sleeping a fixed 500 ms after
@@ -404,8 +405,9 @@ fn (mut h Host) start(now f64) ! {
 	h.seg_threads << spawn segment_worker(mut h)
 	h.state = .recording
 	power_eco(false)
-	spawn preload_worker(h.asr, h.cfg.model_path(), h.cfg.threads, h.cfg.vad_path())
-	hexv_log('listening: model preload started')
+	if !h.asr.is_loaded() {
+		hexv_log('listening: model preload still in progress')
+	}
 }
 
 fn (mut h Host) pump_level() f32 {
@@ -573,7 +575,8 @@ fn (mut h Host) idle_check(now f64) {
 	if h.state != .idle {
 		return
 	}
-	if h.asr.is_loaded() && now - h.last_use >= idle_model_seconds() {
+	limit := idle_model_seconds()
+	if limit > 0.0 && h.asr.is_loaded() && now - h.last_use >= limit {
 		h.asr.close_model()
 		power_eco(true)
 	}
